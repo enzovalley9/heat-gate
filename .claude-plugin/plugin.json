@@ -1,7 +1,7 @@
 {
   "name": "heat-gate",
   "displayName": "heat-gate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Keeps parallel Claude Code sessions from cooking your laptop: live CPU temperature above the prompt, a shared queue for heavy builds, and an emergency freeze before a thermal shutdown",
   "author": { "name": "Enzo Valley", "url": "https://github.com/enzovalley9" },
   "homepage": "https://github.com/enzovalley9/heat-gate",

@@ -6,10 +6,11 @@ When several Claude Code sessions run Gradle, Maven, Cargo or Docker builds at t
 
 ## What it does
 
-- **Band above the prompt** with the CPU temperature, a small chart, the load, whether turbo boost is on and the builds that are running.
+- **Band above the prompt** with the CPU temperature and CPU use, each with its own small chart, the memory in use, the running Docker containers, the load, whether turbo boost is on and the builds that are running.
 - **Shared build queue.** A heavy command waits when the CPU is at or above 80°C, when another build is already running or when one has just started. Queued builds start on their own once the CPU drops below 75°C. While a build waits you can press `1` to run it now or `2` to cancel it. After 30 minutes in the queue it is refused.
 - **Emergency freeze.** At 98°C the build processes are paused with `SIGSTOP` and resumed with `SIGCONT` below 82°C, so a runaway build cannot take the machine down.
-- **`/heat` pane** with a temperature chart (SVG in the desktop app, text in the terminal), the builds, the queue, the processes using the most CPU, a manual freeze button and the command to turn turbo boost off.
+- **`/heat` pane** with CPU, memory (and swap) and Docker tiles, a temperature chart and a CPU and memory chart (SVG in the desktop app, text in the terminal), each container with its CPU and memory, the builds, the queue, the processes using the most CPU, a manual freeze button and the command to turn turbo boost off.
+- **Light on the machine.** One session reads the sensors every 4 seconds and the containers every 2 minutes, and every other session reuses that reading, so opening more sessions adds no load.
 
 Heavy commands are Gradle and Maven tasks such as `build`, `test` or `bootRun`, `cargo build|test|bench|run`, `go build|test`, `npm|pnpm|yarn|bun` builds and tests, `docker build`, `docker compose up` and `bazel build|test`. You can add your own.
 
@@ -17,7 +18,8 @@ If the mod itself fails, the command runs as usual: heat-gate never blocks your 
 
 ## Requirements
 
-- Linux. The temperature comes from `/sys/class/hwmon` (`k10temp`, `zenpower` or `coretemp`) and `/sys/class/thermal`.
+- Linux. The temperature comes from `/sys/class/hwmon` (`k10temp`, `zenpower` or `coretemp`) and `/sys/class/thermal`. CPU and memory come from `/proc/stat` and `/proc/meminfo`.
+- Docker is optional: without it the container figures are hidden.
 - Claude Code 2.1.287 or later in the terminal, or 2.1.286 or later in the Code tab of the desktop app.
 
 ## Install

@@ -5,6 +5,8 @@ const SPARK = 24;
 const GRACE_MS = 45_000;
 const STALE_TICKET_MS = 2 * 60 * 60 * 1000;
 const POLL_SECONDS = "3";
+const DOCKER_MS = 2 * 60 * 1000;
+const DOCKER_CLAIM_MS = 30_000;
 const BARS = "▁▂▃▄▅▆▇█";
 
 const COLOR = { cool: "#87d7ff", ok: "#afd7af", warm: "#ffd787", hot: "#ffaf5f", fire: "#ff5f5f", accent: "#d787ff", dim: "#8a8a8a" };
@@ -58,6 +60,16 @@ const STRINGS = {
     froze: (n, t) => `heat-gate: froze ${n} build processes at ${t}°C to avoid a thermal shutdown`,
     frozeLog: (n, t, thaw) => `builds frozen at ${t}°C (${n} processes). They resume by themselves below ${thaw}°C.`,
     resumed: (t) => `heat-gate: builds resumed (${t}°C)`,
+    memory: "Memory",
+    threads: (load, n) => `load ${load} · ${n} threads`,
+    swap: (used, total) => `swap ${used}/${total} GB`,
+    noSwap: "no swap",
+    containersRunning: (n) => `🐳 ${n} running`,
+    nothingRunning: "nothing running",
+    containersTitle: (n) => `Docker containers (${n})`,
+    noContainers: "  none running",
+    more: (n) => `  and ${n} more`,
+    usageAlt: (cpu, mem) => `CPU and memory use over the last minutes, now CPU ${cpu} percent and memory ${mem} percent`,
   },
   es: {
     levels: ["Fresco", "Templado", "Caliente", "Muy caliente", "Peligro"],
@@ -105,6 +117,16 @@ const STRINGS = {
     froze: (n, t) => `heat-gate: ${n} procesos de build congelados a ${t}°C para evitar el apagado`,
     frozeLog: (n, t, thaw) => `builds congeladas a ${t}°C (${n} procesos). Se reanudan solas por debajo de ${thaw}°C.`,
     resumed: (t) => `heat-gate: builds reanudadas (${t}°C)`,
+    memory: "Memoria",
+    threads: (load, n) => `carga ${load} · ${n} hilos`,
+    swap: (used, total) => `swap ${used}/${total} GB`,
+    noSwap: "sin swap",
+    containersRunning: (n) => `🐳 ${n} arrancados`,
+    nothingRunning: "nada en marcha",
+    containersTitle: (n) => `Contenedores Docker (${n})`,
+    noContainers: "  ninguno arrancado",
+    more: (n) => `  y ${n} más`,
+    usageAlt: (cpu, mem) => `Uso de CPU y memoria en los últimos minutos, ahora CPU ${cpu} por ciento y memoria ${mem} por ciento`,
   },
 };
 
@@ -149,6 +171,9 @@ elif [ -r /sys/devices/system/cpu/intel_pstate/no_turbo ]; then bp=/sys/devices/
 fi
 read l1 _ < /proc/loadavg
 echo "S $t $a $crit $b $l1 $(nproc) $bp"
+read _ u n s i w q sq st _ < /proc/stat
+echo "C $((u + n + s + q + sq + st)) $((i + w))"
+echo "M $(awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ { printf "%s ", $2 }' /proc/meminfo)"
 for p in $(pgrep -f "$1"); do
   e=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' '); [ -z "$e" ] && continue
   st=$(ps -o stat= -p "$p" 2>/dev/null | tr -d ' ')
@@ -171,6 +196,8 @@ let queue = [];
 let stopTimer = null;
 let sessionId = "";
 let surface = "terminal";
+let containers = null;
+let cpuPrev = null;
 
 export function configure(options) {
   cfg = { ...DEFAULTS, ...Object.fromEntries(Object.entries(options ?? {}).filter(([, v]) => v !== undefined && v !== "")) };
@@ -308,7 +335,8 @@ export function register(on, options) {
 }
 
 async function tick($) {
-  await sense($);
+  await sharedSense($);
+  await dockerSense($);
   await guardFreeze($);
   try {
     const stored = await $.store.get("queue");
@@ -331,16 +359,99 @@ async function sense($) {
     return;
   }
   parsed.sample.at = await $.clock.now();
-  samples.push(parsed.sample);
-  if (samples.length > HISTORY) {
-    samples = samples.slice(-HISTORY);
+  parsed.sample.cpu = cpuPrev !== null && parsed.cpu !== null ? cpuPercent(cpuPrev, parsed.cpu) : null;
+  cpuPrev = parsed.cpu ?? cpuPrev;
+  adopt({ sample: parsed.sample, builds: parsed.builds, hogs: parsed.hogs, cpu: cpuPrev });
+  try {
+    await $.store.set("sense", { at: parsed.sample.at, sample: parsed.sample, builds, hogs, cpu: cpuPrev });
+  } catch {
+    // the next tick publishes again
   }
-  builds = parsed.builds;
-  hogs = parsed.hogs;
+}
+
+function adopt(reading) {
+  if (samples.length === 0 || samples[samples.length - 1].at !== reading.sample.at) {
+    samples.push(reading.sample);
+    if (samples.length > HISTORY) {
+      samples = samples.slice(-HISTORY);
+    }
+  }
+  builds = reading.builds ?? [];
+  hogs = reading.hogs ?? [];
+  cpuPrev = reading.cpu ?? cpuPrev;
+}
+
+// Every session shows the same machine, so one of them reads the sensors each tick
+// and publishes the reading; the others reuse it while it is fresh.
+async function sharedSense($) {
+  const now = await $.clock.now();
+  let shared = null;
+  try {
+    shared = await $.store.get("sense");
+  } catch {
+    shared = null;
+  }
+  if (shared?.sample && now - shared.at < TICK_MS - 500) {
+    adopt(shared);
+    return;
+  }
+  await sense($);
+}
+
+export function cpuPercent(before, after) {
+  const busy = after.busy - before.busy;
+  const total = busy + after.idle - before.idle;
+  return total > 0 ? Math.max(0, Math.min(100, (busy / total) * 100)) : null;
+}
+
+// One read every two minutes for every session together: the first session past the
+// deadline claims the turn in the shared store and the others reuse its result.
+async function dockerSense($) {
+  const now = await $.clock.now();
+  let shared = null;
+  try {
+    shared = await $.store.get("docker");
+  } catch {
+    shared = null;
+  }
+  if (shared && "list" in shared) {
+    containers = shared.list;
+  }
+  if (shared && (now - (shared.at ?? 0) < DOCKER_MS || now - (shared.claim ?? 0) < DOCKER_CLAIM_MS)) {
+    return;
+  }
+  await $.store.set("docker", { ...(shared ?? {}), claim: now });
+  try {
+    const run = await $.process.run(["docker", "stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}"], { timeoutMs: 8000 });
+    containers = run.exitCode === 0 ? parseDocker(run.stdout) : null;
+  } catch {
+    containers = null;
+  }
+  await $.store.set("docker", { at: now, list: containers });
+}
+
+const UNITS = { B: 1, KB: 1e3, KIB: 1024, MB: 1e6, MIB: 1024 ** 2, GB: 1e9, GIB: 1024 ** 3, TB: 1e12, TIB: 1024 ** 4 };
+
+export function bytesOf(text) {
+  const m = String(text).trim().match(/^([\d.]+)\s*([KMGT]?i?B)$/i);
+  return m ? Number(m[1]) * (UNITS[m[2].toUpperCase()] ?? 1) : 0;
+}
+
+export function parseDocker(stdout) {
+  return String(stdout)
+    .split("\n")
+    .filter((l) => l.includes("|"))
+    .map((l) => {
+      const [name, cpu, usage] = l.split("|");
+      return { name: name.trim(), cpu: Number.parseFloat(cpu) || 0, mem: bytesOf(String(usage).split("/")[0]) };
+    })
+    .sort((a, b) => b.cpu - a.cpu || b.mem - a.mem);
 }
 
 export function parseSense(stdout) {
   let sample = null;
+  let cpu = null;
+  let mem = null;
   const found = [];
   const top = [];
   for (const line of String(stdout).split("\n")) {
@@ -357,6 +468,12 @@ export function parseSense(stdout) {
         load: Number(l1) || 0,
         ncpu: Number(n) || 1,
       };
+    } else if (line.startsWith("C ")) {
+      const [, busy, idle] = line.split(" ").map(Number);
+      cpu = Number.isFinite(busy) && Number.isFinite(idle) ? { busy, idle } : null;
+    } else if (line.startsWith("M ")) {
+      const [total, avail, swapTotal, swapFree] = line.slice(2).trim().split(/\s+/).map((v) => Number(v) * 1024);
+      mem = total > 0 ? { used: total - avail, total, swapUsed: (swapTotal || 0) - (swapFree || 0), swapTotal: swapTotal || 0 } : null;
     } else if (line.startsWith("B\t")) {
       const [, pid, etimes, stat, cwd, args] = line.split("\t");
       found.push({ pid: Number(pid), seconds: Number(etimes) || 0, stopped: /T/.test(stat ?? ""), cwd: cwd ?? "", tasks: tasksOf(args ?? "") });
@@ -365,7 +482,10 @@ export function parseSense(stdout) {
       top.push({ pcpu: Number(pcpu) || 0, comm: comm ?? "" });
     }
   }
-  return { sample, builds: found, hogs: top };
+  if (sample !== null) {
+    sample.mem = mem;
+  }
+  return { sample, builds: found, hogs: top, cpu };
 }
 
 export function tasksOf(args) {
@@ -506,6 +626,40 @@ function spark(t, count) {
   return samples.slice(-count).map((s, i) => t.Text({ key: `sp${i}`, color: levelOf(s.tctl).color, children: bar(s.tctl) }));
 }
 
+export function usageColor(percent) {
+  return percent >= 85 ? COLOR.fire : percent >= 70 ? COLOR.hot : percent >= 50 ? COLOR.warm : COLOR.ok;
+}
+
+export function pctBar(percent) {
+  const ratio = Math.max(0, Math.min(1, percent / 100));
+  return BARS[Math.min(BARS.length - 1, Math.floor(ratio * BARS.length))];
+}
+
+function usageSpark(t, key, count, pick) {
+  return samples
+    .slice(-count)
+    .filter((s) => pick(s) !== null)
+    .map((s, i) => t.Text({ key: `${key}${i}`, color: usageColor(pick(s)), children: pctBar(pick(s)) }));
+}
+
+export function memPercent(mem) {
+  return mem && mem.total > 0 ? (mem.used / mem.total) * 100 : null;
+}
+
+export function meter(percent, width) {
+  const full = Math.round((Math.max(0, Math.min(100, percent)) / 100) * width);
+  return "▰".repeat(full) + "▱".repeat(width - full);
+}
+
+export function gb(bytes) {
+  const g = bytes / 1024 ** 3;
+  return g >= 10 ? g.toFixed(0) : g.toFixed(1);
+}
+
+function human(bytes) {
+  return bytes >= 1024 ** 3 ? `${gb(bytes)} GB` : `${Math.round(bytes / 1024 ** 2)} MB`;
+}
+
 export function labelOf(command) {
   const jvm = command.match(/(?:\.\/)?(gradlew|gradle|mvnw|mvn)\b([^;&|]*)/);
   if (jvm) {
@@ -530,27 +684,43 @@ function band(t, columns) {
   const { Box, Text } = t;
   const s = last();
   const lv = levelOf(s.tctl);
-  const running = builds.filter((b) => !b.stopped);
-  const parts = [
-    Text({ key: "temp", color: lv.color, bold: true, children: `● ${Math.round(s.tctl)}°C` }),
-    Text({ key: "sp-gap", children: " " }),
-    ...spark(t, columns >= 90 ? SPARK : 10),
-    Text({ key: "load", dimColor: true, children: `  ${L.load} ${s.load.toFixed(1)}/${s.ncpu}` }),
-  ];
-  if (s.boost !== null) {
-    parts.push(Text({ key: "boost", color: s.boost ? COLOR.warm : COLOR.dim, children: `  ${s.boost ? L.turboOn : L.turboOff}` }));
+  const wide = columns >= 110;
+  const width = wide ? 16 : 8;
+  const sep = (k) => Text({ key: k, dimColor: true, children: "  │  " });
+  const metrics = [Text({ key: "temp", color: lv.color, bold: true, children: `● ${Math.round(s.tctl)}°C ` }), ...spark(t, width)];
+  if (s.cpu !== null && s.cpu !== undefined) {
+    metrics.push(sep("s1"), Text({ key: "cpu-l", dimColor: true, children: "CPU " }), Text({ key: "cpu", color: usageColor(s.cpu), bold: true, children: `${String(Math.round(s.cpu)).padStart(2)}% ` }), ...usageSpark(t, "cs", width, (x) => x.cpu ?? null));
   }
+  const mp = memPercent(s.mem);
+  if (mp !== null) {
+    metrics.push(sep("s2"), Text({ key: "ram-l", dimColor: true, children: "RAM " }), Text({ key: "ram", color: usageColor(mp), bold: true, children: `${gb(s.mem.used)}/${gb(s.mem.total)}G ` }), Text({ key: "ram-m", color: usageColor(mp), children: meter(mp, wide ? 8 : 5) }));
+  }
+  if (containers !== null) {
+    const total = containers.reduce((sum, c) => sum + c.mem, 0);
+    metrics.push(sep("s3"), Text({ key: "dk", color: containers.length > 0 ? COLOR.cool : COLOR.dim, children: `🐳 ${containers.length}${containers.length > 0 && wide ? ` · ${human(total)}` : ""}` }));
+  }
+  metrics.push(sep("s4"), Text({ key: "load", dimColor: true, children: `${L.load} ${s.load.toFixed(1)}/${s.ncpu}` }));
+  if (s.boost !== null) {
+    metrics.push(Text({ key: "boost", color: s.boost ? COLOR.warm : COLOR.dim, children: ` · ${s.boost ? L.turboOn : L.turboOff}` }));
+  }
+
+  const activity = [];
+  const running = builds.filter((b) => !b.stopped);
   if (running.length > 0) {
     const first = running[0];
-    parts.push(Text({ key: "builds", color: COLOR.accent, children: `  ⚙ ${L.builds(running.length)}${shortPath(first.cwd)} ${first.tasks} ${ago(first.seconds)}` }));
+    activity.push(Text({ key: "builds", color: COLOR.accent, children: `⚙ ${L.builds(running.length)}${shortPath(first.cwd)} ${first.tasks} ${ago(first.seconds)}  ` }));
   }
   if (queue.length > 0) {
-    parts.push(Text({ key: "queue", color: COLOR.warm, children: `  ⏸ ${L.queued(queue.length)}` }));
+    activity.push(Text({ key: "queue", color: COLOR.warm, children: `⏸ ${L.queued(queue.length)}  ` }));
   }
   if (frozen !== null) {
-    parts.push(Text({ key: "frozen", color: COLOR.cool, bold: true, children: `  ❄ ${L.frozenBadge}` }));
+    activity.push(Text({ key: "frozen", color: COLOR.cool, bold: true, children: `❄ ${L.frozenBadge}` }));
   }
-  return Box({ key: "heat-band", flexDirection: "row", paddingX: 1, children: parts });
+  const rows = [Box({ key: "metrics", flexDirection: "row", children: metrics })];
+  if (activity.length > 0) {
+    rows.push(Box({ key: "activity", flexDirection: "row", children: activity }));
+  }
+  return Box({ key: "heat-band", flexDirection: "column", paddingX: 1, children: rows });
 }
 
 function heldCard(t, state, inBand) {
@@ -607,7 +777,13 @@ function pane(t, where, columns, $) {
       ],
     }),
   );
-  rows.push(where === "desktop" && t.Svg ? chartSvg(t, s.crit) : chartText(t, Math.max(20, Math.min(HISTORY, columns - 8))));
+  rows.push(stats(t, s));
+  if (where === "desktop" && t.Svg) {
+    rows.push(chartSvg(t, s.crit), usageSvg(t));
+  } else {
+    const width = Math.max(20, Math.min(HISTORY, columns - 8));
+    rows.push(chartText(t, width), usageText(t, width));
+  }
   if (held !== null) {
     rows.push(heldCard(t, held, false));
   }
@@ -629,6 +805,29 @@ function pane(t, where, columns, $) {
         ],
       }),
     );
+  }
+
+  if (containers !== null) {
+    rows.push(section(t, "docker", L.containersTitle(containers.length)));
+    if (containers.length === 0) {
+      rows.push(Text({ key: "nod", dimColor: true, children: L.noContainers }));
+    }
+    for (const c of containers.slice(0, 12)) {
+      rows.push(
+        Text({
+          key: `dk-${c.name}`,
+          wrap: "truncate-end",
+          children: [
+            Text({ color: usageColor(Math.min(100, c.cpu)), children: `  ${c.cpu.toFixed(1).padStart(6)}%  ` }),
+            Text({ color: COLOR.cool, children: `${human(c.mem).padStart(7)}  ` }),
+            Text({ children: c.name }),
+          ],
+        }),
+      );
+    }
+    if (containers.length > 12) {
+      rows.push(Text({ key: "dk-more", dimColor: true, children: L.more(containers.length - 12) }));
+    }
   }
 
   if (queue.length > 0) {
@@ -657,6 +856,65 @@ function pane(t, where, columns, $) {
   rows.push(Text({ key: "rules", dimColor: true, children: L.rules(cfg) }));
 
   return Box({ flexDirection: "column", paddingX: 1, children: rows });
+}
+
+function stats(t, s) {
+  const { Box, Text } = t;
+  const tile = (key, label, value, color, extra) =>
+    Box({
+      key,
+      flexDirection: "column",
+      borderStyle: "round",
+      borderColor: COLOR.dim,
+      paddingX: 1,
+      children: [Text({ key: "l", dimColor: true, children: label }), Text({ key: "v", bold: true, color, children: value }), Text({ key: "x", dimColor: true, children: extra })],
+    });
+  const tiles = [];
+  if (s.cpu !== null && s.cpu !== undefined) {
+    tiles.push(tile("t-cpu", "CPU", `${Math.round(s.cpu)}%  ${meter(s.cpu, 10)}`, usageColor(s.cpu), L.threads(s.load.toFixed(1), s.ncpu)));
+  }
+  const mp = memPercent(s.mem);
+  if (mp !== null) {
+    tiles.push(tile("t-ram", L.memory, `${gb(s.mem.used)}/${gb(s.mem.total)} GB  ${meter(mp, 10)}`, usageColor(mp), s.mem.swapTotal > 0 ? L.swap(gb(s.mem.swapUsed), gb(s.mem.swapTotal)) : L.noSwap));
+  }
+  if (containers !== null) {
+    const cpu = containers.reduce((sum, c) => sum + c.cpu, 0);
+    const memory = containers.reduce((sum, c) => sum + c.mem, 0);
+    tiles.push(tile("t-dk", "Docker", L.containersRunning(containers.length), COLOR.cool, containers.length > 0 ? `${cpu.toFixed(0)}% CPU · ${human(memory)}` : L.nothingRunning));
+  }
+  return Box({ key: "stats", flexDirection: "row", gap: 1, marginTop: 1, children: tiles });
+}
+
+function usageText(t, width) {
+  const { Box, Text } = t;
+  const line = (key, label, pick) => Box({ key, flexDirection: "row", children: [Text({ key: "l", dimColor: true, children: label }), ...usageSpark(t, key, width, pick)] });
+  return Box({ key: "usage", flexDirection: "column", marginTop: 1, children: [line("u-cpu", "CPU  ", (x) => x.cpu ?? null), line("u-ram", "RAM  ", (x) => memPercent(x.mem))] });
+}
+
+function usageSvg(t) {
+  const W = 560;
+  const H = 110;
+  const data = samples.slice(-HISTORY);
+  const y = (v) => H - 16 - (Math.max(0, Math.min(100, v)) / 100) * (H - 26);
+  const x = (i) => 36 + ((i + HISTORY - data.length) / Math.max(1, HISTORY - 1)) * (W - 44);
+  const path = (pick) =>
+    data
+      .map((s, i) => [i, pick(s)])
+      .filter(([, v]) => v !== null && v !== undefined)
+      .map(([i, v]) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`)
+      .join(" ");
+  const cpu = path((s) => s.cpu);
+  const ram = path((s) => memPercent(s.mem));
+  const grid = [0, 50, 100].map((v) => `<line x1="36" x2="${W - 8}" y1="${y(v)}" y2="${y(v)}" stroke="${COLOR.dim}" stroke-width="0.5" opacity="0.4"/><text x="4" y="${y(v) + 4}" font-size="10" fill="${COLOR.dim}" font-family="sans-serif">${v}%</text>`).join("");
+  const source = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
+${grid}
+${ram ? `<polyline points="${ram}" fill="none" stroke="${COLOR.accent}" stroke-width="2" stroke-linejoin="round"/>` : ""}
+${cpu ? `<polyline points="${cpu}" fill="none" stroke="${COLOR.cool}" stroke-width="2" stroke-linejoin="round"/>` : ""}
+<circle cx="44" cy="${H - 4}" r="3" fill="${COLOR.cool}"/><text x="51" y="${H - 1}" font-size="10" fill="${COLOR.dim}" font-family="sans-serif">CPU</text>
+<circle cx="90" cy="${H - 4}" r="3" fill="${COLOR.accent}"/><text x="97" y="${H - 1}" font-size="10" fill="${COLOR.dim}" font-family="sans-serif">RAM</text>
+</svg>`;
+  const now = last();
+  return t.Svg({ source, alt: L.usageAlt(Math.round(now?.cpu ?? 0), Math.round(memPercent(now?.mem) ?? 0)), width: W, height: H });
 }
 
 function section(t, key, title) {

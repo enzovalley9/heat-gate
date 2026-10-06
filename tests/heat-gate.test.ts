@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { configure, isHeavy, labelOf, levelOf, parseSense, tasksOf, turboCommand } from '../hooks/heat-gate.mjs'
+import { bytesOf, configure, cpuPercent, isHeavy, labelOf, levelOf, meter, parseDocker, parseSense, tasksOf, turboCommand } from '../hooks/heat-gate.mjs'
 
 const sense = (tctl: number, builds = '') =>
   `S ${tctl * 1000} ${tctl * 1000} 105000 1 7.40 16 /sys/devices/system/cpu/cpufreq/boost\n${builds}P\t227\tjava\nP\t96\tnode\n`
@@ -45,10 +45,32 @@ test('reads sensors, builds and processes', () => {
   configure({})
 })
 
-function stubs(on: any, state: { tctl: number; builds: string; saved: Map<string, unknown>; ran: string[] }) {
+test('reads CPU, memory and containers', () => {
+  const out = parseSense('S 50000 50000 105000 0 1.0 16 x\nC 1000 3000\nM 32000000 12000000 8000000 6000000\n')
+  expect(out.cpu).toEqual({ busy: 1000, idle: 3000 })
+  expect(out.sample.mem).toEqual({ used: 20000000 * 1024, total: 32000000 * 1024, swapUsed: 2000000 * 1024, swapTotal: 8000000 * 1024 })
+  expect(cpuPercent({ busy: 1000, idle: 3000 }, { busy: 1400, idle: 3600 })).toBe(40)
+  expect(cpuPercent({ busy: 1, idle: 1 }, { busy: 1, idle: 1 })).toBe(null)
+  expect(bytesOf('1.5GiB')).toBe(1.5 * 1024 ** 3)
+  expect(bytesOf('300kB')).toBe(300_000)
+  expect(parseDocker('a|1.0%|10MiB / 1GiB\nb|80.2%|2GiB / 30GiB\n').map((c: any) => c.name)).toEqual(['b', 'a'])
+  expect(parseDocker('')).toEqual([])
+  expect(meter(50, 6)).toBe('▰▰▰▱▱▱')
+})
+
+function stubs(on: any, state: { tctl: number; builds: string; saved: Map<string, unknown>; ran: string[]; docker?: number; sensed?: number }) {
   const clock = mock.clock(on, { now: 1_000_000 })
+  let busy = 1000
   on('process.run', async ($: any, e: any) => {
-    if (e.argv[0] === 'bash') return { value: { exitCode: 0, stdout: sense(state.tctl, state.builds), stderr: '' } }
+    if (e.argv[0] === 'bash') {
+      state.sensed = (state.sensed ?? 0) + 1
+      busy += 400
+      return { value: { exitCode: 0, stdout: `${sense(state.tctl, state.builds)}C ${busy} ${busy + 600}\nM 32000000 12000000 8000000 6000000\n`, stderr: '' } }
+    }
+    if (e.argv[0] === 'docker') {
+      state.docker = (state.docker ?? 0) + 1
+      return { value: { exitCode: 0, stdout: 'postgres|12.5%|512MiB / 30GiB\nrabbitmq|3.1%|1.5GiB / 30GiB\n', stderr: '' } }
+    }
     if (e.argv[0] === 'sleep') await clock.sleep(Number(e.argv[1]) * 1000)
     return { value: { exitCode: 0, stdout: '', stderr: '' } }
   })
@@ -125,4 +147,68 @@ test('another running build makes it wait and "Cancel" refuses it', async ($, on
   const r: any = await pending
   expect(r.deny).toMatch(/cancelled/)
   expect(state.ran).toEqual([])
+})
+
+function startStubs(on: any) {
+  on('session.start', () => ({ cwd: '/work' }))
+  on('session.id', () => ({ value: 's1' }))
+  on('command.register', () => ({ value: undefined }))
+}
+
+test('the band shows CPU, RAM and containers', async ($, on) => {
+  configure({})
+  const state = { tctl: 55, builds: '', saved: new Map(), ran: [] as string[] }
+  const clock = stubs(on, state)
+  startStubs(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+  await clock.advance(9000)
+  expect(state.saved.get('docker')).toMatchObject({ list: [{ name: 'postgres' }, { name: 'rabbitmq' }] })
+  const ui = await $.ui.mount(BAND)
+  expect(await waitFor(clock, ui, /CPU/)).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /50%/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /19\/31G/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /🐳 2 · 2\.0 GB/ })).toBeDefined()
+})
+
+test('docker is read once every 2 minutes across all sessions', async ($, on) => {
+  configure({})
+  const state = { tctl: 55, builds: '', saved: new Map(), ran: [] as string[], docker: 0 }
+  const clock = stubs(on, state)
+  startStubs(on)
+  state.saved.set('docker', { at: 1_000_000 - 30_000, list: [{ name: 'other-session', cpu: 1, mem: 1 }] })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+  await clock.advance(60_000)
+  expect(state.docker).toBe(0)
+  await clock.advance(40_000)
+  expect(state.docker).toBe(1)
+  await clock.advance(60_000)
+  expect(state.docker).toBe(1)
+})
+
+test('sessions share one sensor reading', async ($, on) => {
+  configure({})
+  const state = { tctl: 55, builds: '', saved: new Map(), ran: [] as string[], sensed: 0 }
+  const clock = stubs(on, state)
+  startStubs(on)
+  state.saved.set('sense', { at: 1_000_000, sample: { tctl: 61, zone: 61, crit: 105, boost: false, boostPath: null, load: 1, ncpu: 16, at: 1_000_000, cpu: 12, mem: null }, builds: [], hogs: [], cpu: { busy: 1, idle: 1 } })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+  expect(state.sensed).toBe(0)
+  const ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: /61°C/ })).toBeDefined()
+  await clock.advance(4000)
+  expect(state.sensed).toBe(1)
+})
+
+test('the desktop band and pane render', async ($, on) => {
+  configure({})
+  const state = { tctl: 55, builds: '', saved: new Map(), ran: [] as string[] }
+  const clock = stubs(on, state)
+  startStubs(on)
+  await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' } as any)
+  await clock.advance(9000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await band.find({ type: 'Text', text: /CPU/ })).toBeDefined()
+  const pane = await $.ui.mount({ plugin: 'heat-gate', component: 'Pane', surface: 'desktop', requestId: 'heat-gate', viewport: { columns: 160, rows: 50 }, props: { title: 'heat-gate', isFocused: true, bodyColumns: 120, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } } as any)
+  expect(await pane.find({ type: 'Text', text: /postgres/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /Docker containers \(2\)/ })).toBeDefined()
 })
