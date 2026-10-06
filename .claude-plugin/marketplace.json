@@ -1,0 +1,8 @@
+{
+  "name": "heat-gate",
+  "owner": { "name": "Enzo Valley", "url": "https://github.com/enzovalley9" },
+  "metadata": { "description": "heat-gate, a Claude Code mod that keeps parallel builds from overheating your machine" },
+  "plugins": [
+    { "name": "heat-gate", "source": "./", "description": "Live CPU temperature, a shared build queue and an emergency freeze before a thermal shutdown" }
+  ]
+}
