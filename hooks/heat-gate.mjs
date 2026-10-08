@@ -323,7 +323,7 @@ export function register(on, options) {
     const t = $.ui.resolve(e);
     const theirs = await next(e);
     const mine = held !== null ? heldCard(t, held, true) : band(t, props.bodyColumns ?? 100);
-    return t.Box({ flexDirection: "column", children: [mine, theirs].filter(Boolean) });
+    return t.Box({ flexDirection: "column", children: [theirs, mine].filter(Boolean) });
   });
 
   on("ui.render", { component: "Pane" }, ($, e, next) => {
