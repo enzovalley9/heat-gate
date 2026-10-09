@@ -38,6 +38,20 @@ A heavy command starts at once when the CPU is below `hold_above`, no build is r
 
 The emergency freeze only touches build processes: Gradle daemons and workers, Gradle test executors, Maven and `rustc`/`cargo`. Your editor, browser and containers are never paused.
 
+## In the terminal
+
+Real Claude Code CLI captures, with a Gradle build running in `payments-api`:
+
+![heat-gate's band in the CLI, with the temperature, CPU, memory, Docker and the running build](docs/heat-gate-cli-band.png)
+
+The same band in a 64 column terminal: the load moves to a second line and no metric is split.
+
+![heat-gate's band in a narrow terminal](docs/heat-gate-cli-band-narrow.png)
+
+The `/heat` pane in the terminal, with text charts:
+
+![The /heat pane in the CLI](docs/heat-gate-cli-pane.png)
+
 ## Requirements
 
 - Linux or macOS.
