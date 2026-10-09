@@ -16,12 +16,13 @@ When several Claude Code sessions run Gradle, Maven, Cargo or Docker builds at t
   ![The same band at 130, 100, 76, 58 and 40 columns](docs/heat-gate-responsive.png)
 
 - **Shared build queue.** A heavy command waits when the CPU is at or above 80°C, when another build is already running or when one has just started. Queued builds start on their own once the CPU drops below 75°C. While a build waits you can press `1` to run it now or `2` to cancel it. After 30 minutes in the queue it is refused.
-- **Emergency freeze.** At 98°C the build processes are paused with `SIGSTOP` and resumed with `SIGCONT` below 82°C, so a runaway build cannot take the machine down.
+- **Servers do not block the queue.** `bootRun`, `run`, `spring-boot:run`, `quarkusDev`, a continuous Gradle build (`-t`) or `cargo run` wait their turn to start, since they compile first, but once they are up they no longer count as a running build.
+- **Emergency freeze.** At 98°C the build processes are paused with `SIGSTOP` and resumed with `SIGCONT` below 82°C, so a runaway build cannot take the machine down. Every freeze also arms a safety timer outside Claude Code that resumes those processes after 10 minutes at most, even if every session is closed or the mod is removed; if the CPU is still that hot, the next check freezes them again.
 - **Linux and macOS.** On a Mac, with Apple Silicon or Intel, the gate follows the thermal pressure that macOS reports (see [macOS](#macos)).
 - **`/heat` pane** with CPU, memory (and swap) and Docker tiles, a temperature chart and a CPU and memory chart (SVG in the desktop app, text in the terminal), each container with its CPU and memory, the builds, the queue, the processes using the most CPU, a manual freeze button and the command to turn turbo boost off.
 - **Light on the machine.** One session reads the sensors every 4 seconds and the containers every 2 minutes, and every other session reuses that reading, so opening more sessions adds no load.
 
-Heavy commands are Gradle and Maven tasks such as `build`, `test` or `bootRun`, `cargo build|test|bench|run`, `go build|test`, `npm|pnpm|yarn|bun` builds and tests, `docker build`, `docker compose up` and `bazel build|test`. You can add your own.
+Heavy commands are Gradle and Maven tasks such as `build`, `test` or `bootRun`, `cargo build|test|bench|run`, `go build|test`, `npm|pnpm|yarn|bun` builds and tests, `docker build`, `docker compose up` and `bazel build|test`. Each part of a command line (split on `;`, `&&`, `||`, `|` and new lines) is judged by the program it runs, after variables such as `FOO=1` and wrappers such as `timeout`, `env` or `nice`, so `/repo/gradlew build` or `"./gradlew" test` count and `git commit -m "fix go test"` does not. You can add your own.
 
 If the mod itself fails, the command runs as usual: heat-gate never blocks your work because of a bug of its own.
 
@@ -34,9 +35,11 @@ If the mod itself fails, the command runs as usual: heat-gate never blocks your 
 
 ## How the queue decides
 
-A heavy command starts at once when the CPU is below `hold_above`, no build is running on the machine, none has started in the last 45 seconds and nothing is queued ahead of it. Otherwise it waits, checks again every 3 seconds and starts once the CPU is below `release_below` and it is first in line. The queue lives in the plugin store, so sessions started from different terminals or the desktop app take turns in order.
+A heavy command starts at once when the CPU is below `hold_above`, no build is running on the machine, none has started in the last 45 seconds and nothing is queued ahead of it. Otherwise it waits, checks again every 3 seconds and starts once the CPU is below `release_below` and it is first in line. The queue lives in the plugin store, so sessions started from different terminals or the desktop app take turns in order, and a short lock in the plugin's data folder makes sure two sessions never take the same turn.
 
-The emergency freeze only touches build processes: Gradle daemons and workers, Gradle test executors, Maven and `rustc`/`cargo`. Your editor, browser and containers are never paused.
+A queued build renews its place in the queue every time it checks. A build interrupted with Esc gives its turn back, and when a session ends its queued builds leave the queue at once. A turn that nobody renews for 15 seconds, such as one from a session that died without closing, drops out on its own, so it never holds the others. A `/clear` or a `/resume` keeps the band running.
+
+The emergency freeze only touches your own build processes: Java processes whose main class is a Gradle daemon or worker (test executors included) or Maven, and `rustc`/`cargo`. Your editor, browser, containers and shells are never paused.
 
 ## In the terminal
 
@@ -102,13 +105,13 @@ Set them in `/plugin`, or pass `--config KEY=VALUE` to `claude plugin install`.
 claude plugin uninstall heat-gate@heat-gate
 ```
 
-If a freeze was active when the mod was removed, resume the builds with `pkill -CONT -f GradleDaemon` (or the process you need).
+If a freeze was active when the mod was removed, the builds resume on their own within 10 minutes. To resume them at once, run `pkill -CONT -f GradleDaemon` (or the process you need).
 
 ## Tests
 
 ```bash
 claude plugin test
-claude plugin validate
+claude plugin validate .
 ```
 
 The tests drive the hooks with fake sensors, so they pass on any machine.

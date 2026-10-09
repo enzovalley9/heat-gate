@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { bandPlan, bytesOf, canThaw, cellsOf, configure, cpuPercent, heatLabel, isHeavy, labelOf, levelOf, meter, jobOf, parseDocker, parseSense, pressureOf, projectOf, secondsOf, shouldFreeze, tooHot, turboCommand } from '../hooks/heat-gate.mjs'
+import { BUILD_PATTERN, FREEZE_PATTERN, bandPlan, bytesOf, canThaw, cellsOf, configure, cpuPercent, heatLabel, isContinuous, isHeavy, labelOf, levelOf, meter, jobOf, parseDocker, parseSense, pressureOf, projectOf, secondsOf, shouldFreeze, tooHot, turboCommand } from '../hooks/heat-gate.mjs'
 
 const sense = (tctl: number, builds = '') =>
   `S ${tctl * 1000} ${tctl * 1000} 105000 1 7.40 16 /sys/devices/system/cpu/cpufreq/boost\n${builds}P\t227\tjava\nP\t96\tnode\n`
@@ -24,6 +24,68 @@ test('spots heavy builds and lets everything else through', () => {
   configure({ extra_build_pattern: '\\bmake\\s+-j' })
   expect(isHeavy('make -j8')).toBe(true)
   configure({})
+})
+
+test('a heavy command is the program of a segment, never a word inside another command', () => {
+  configure({})
+  for (const c of [
+    '/abs/repo/gradlew build',
+    '../gradlew build',
+    '"./gradlew" test',
+    'FOO=1 timeout 600 ./gradlew test',
+    'env JAVA_HOME=/opt/jdk nice -n 5 ./gradlew check',
+    '(cd api && ./gradlew :api:test --tests com.acme.OrderTest)',
+    'cd api; ./gradlew test 2>&1 | tail -50',
+    './gradlew \\\n  build',
+    './mvnw spring-boot:run',
+    'mvn failsafe:integration-test',
+    'docker-compose up -d',
+    'docker buildx build .',
+  ]) expect(isHeavy(c), c).toBe(true)
+  for (const c of [
+    'git commit -m "fix go test flakiness"',
+    'git add gradle/build-logic/x.kts',
+    './gradlew dependencies --configuration compileClasspath',
+    './gradlew clean -x test',
+    './gradlew dependencies > test',
+    'echo "./gradlew build"',
+    'ps aux | grep GradleDaemon',
+    'pkill -f GradleDaemon',
+    'command -v gradle',
+  ]) expect(isHeavy(c), c).toBe(false)
+  expect(labelOf('cd api; ./gradlew test 2>&1 | tail -50')).toBe('gradlew test')
+  expect(labelOf('FOO=1 timeout 600 "./gradlew" -p app check')).toBe('gradlew check')
+})
+
+test('a dev server or a continuous build is not a running build', () => {
+  const wrapper = 'java -cp /x/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain'
+  const maven = 'java -cp /x/plexus-classworlds.jar org.codehaus.plexus.classworlds.launcher.Launcher'
+  for (const args of [`${wrapper} bootRun`, `${wrapper} :app:run`, `${wrapper} quarkusDev`, `${wrapper} -t test`, `${wrapper} --continuous build`, `${maven} spring-boot:run`, `${maven} quarkus:dev`, '/home/u/.cargo/bin/cargo run --bin api']) {
+    expect(isContinuous(args), args).toBe(true)
+  }
+  for (const args of [`${wrapper} build`, `${wrapper} test --tests RunnerTest`, `${maven} -t toolchains.xml verify`, '/home/u/.cargo/bin/cargo build']) {
+    expect(isContinuous(args), args).toBe(false)
+  }
+  const out = parseSense(sense(60, `B\t1\t900\tSl\t/p/api\t${wrapper} bootRun\nB\t2\t30\tSl\t/p/web\t${wrapper} build\nB\t3\t600\tSl\t/p/rs\t/u/cargo run\n`))
+  expect(out.builds.map((b: any) => b.pid)).toEqual([2])
+})
+
+test('the process patterns match the executable, never a shell that mentions it', () => {
+  const build = new RegExp(BUILD_PATTERN)
+  const freeze = new RegExp(FREEZE_PATTERN)
+  expect(build.test('/usr/lib/jvm/bin/java -Xmx64m -classpath /x/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain build')).toBe(true)
+  expect(build.test('java -classpath /x/plexus-classworlds.jar org.codehaus.plexus.classworlds.launcher.Launcher verify')).toBe(true)
+  expect(build.test('/home/u/.rustup/toolchains/stable/bin/cargo build --release')).toBe(true)
+  expect(build.test('/usr/local/go/bin/go test ./...')).toBe(true)
+  for (const line of ['/bin/bash -c git commit -m "fix go test flake"', 'vim org.gradle.wrapper.GradleWrapperMain', `bash -c ... heat-gate ${BUILD_PATTERN}`]) {
+    expect(build.test(line), line).toBe(false)
+  }
+  expect(freeze.test('/opt/jdk/bin/java --add-opens=a -cp /x/gradle-launcher.jar org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.12')).toBe(true)
+  expect(freeze.test("/opt/jdk/bin/java -cp /x/w.jar worker.org.gradle.process.internal.worker.GradleWorkerMain 'Gradle Test Executor 3'")).toBe(true)
+  expect(freeze.test('/home/u/.rustup/toolchains/stable/bin/rustc --crate-name api src/lib.rs')).toBe(true)
+  for (const line of ['/usr/bin/zsh -c ps aux | grep GradleDaemon', 'pkill -f GradleDaemon', 'tail -f /tmp/GradleWorkerMain.log', `sh -c exec pgrep -u "$(id -u)" -f "$1" heat-gate ${FREEZE_PATTERN}`]) {
+    expect(freeze.test(line), line).toBe(false)
+  }
 })
 
 test('labels a build with its tool and tasks', () => {
@@ -101,10 +163,35 @@ test('on a Mac the thermal pressure decides, not the degrees', () => {
   configure({})
 })
 
-function stubs(on: any, state: { tctl: number; builds: string; saved: Map<string, unknown>; ran: string[]; docker?: number; sensed?: number; pressure?: number }) {
+type State = {
+  tctl: number
+  builds: string
+  saved: Map<string, unknown>
+  ran: string[]
+  docker?: number
+  sensed?: number
+  pressure?: number
+  calls?: string[][]
+  writes?: [string, unknown][]
+  pgrep?: string
+  lockBusy?: boolean
+  abort?: boolean
+  onCont?: () => void
+}
+
+function stubs(on: any, state: State) {
   const clock = mock.clock(on, { now: 1_000_000 })
   let busy = 1000
   on('process.run', async ($: any, e: any) => {
+    state.calls?.push([...e.argv])
+    const script = String(e.argv[2] ?? '')
+    if (e.argv[0] === 'sh' && script.includes('admit.lock')) {
+      return { value: { exitCode: state.lockBusy ? 1 : 0, stdout: state.lockBusy ? '' : '/data/heat-gate/admit.lock\n', stderr: '' } }
+    }
+    if (e.argv[0] === 'sh' && script.includes('pgrep')) {
+      return { value: { exitCode: 0, stdout: state.pgrep ?? '', stderr: '' } }
+    }
+    if (e.argv[0] === 'kill' && e.argv[1] === '-CONT') state.onCont?.()
     if (e.argv[0] === 'bash') {
       state.sensed = (state.sensed ?? 0) + 1
       busy += 400
@@ -117,11 +204,15 @@ function stubs(on: any, state: { tctl: number; builds: string; saved: Map<string
       state.docker = (state.docker ?? 0) + 1
       return { value: { exitCode: 0, stdout: 'postgres|12.5%|512MiB / 30GiB\nrabbitmq|3.1%|1.5GiB / 30GiB\n', stderr: '' } }
     }
-    if (e.argv[0] === 'sleep') await clock.sleep(Number(e.argv[1]) * 1000)
+    if (e.argv[0] === 'sleep') {
+      await clock.sleep(Number(e.argv[1]) * 1000)
+      if (state.abort) throw new Error('the dispatch was aborted')
+    }
     return { value: { exitCode: 0, stdout: '', stderr: '' } }
   })
   on('store.get', ($: any, e: any) => ({ value: state.saved.get(e.key) }))
   on('store.set', ($: any, e: any) => {
+    state.writes?.push([e.key, e.value])
     state.saved.set(e.key, e.value)
     return { value: undefined }
   })
@@ -224,8 +315,208 @@ test('another running build makes it wait and "Cancel" refuses it', async ($, on
   expect(state.ran).toEqual([])
 })
 
+const PANE = { plugin: 'heat-gate', component: 'Pane', surface: 'terminal', requestId: 'heat-gate', viewport: { columns: 160, rows: 50 }, props: { title: 'heat-gate', isFocused: true, bodyColumns: 120, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } } as any
+
+test('a dev server that is running does not hold the next build', async ($, on) => {
+  const state = { tctl: 62, builds: 'B\t9\t900\tSl\t/p/api\tjava -cp x org.gradle.wrapper.GradleWrapperMain bootRun\n', saved: new Map(), ran: [] as string[] }
+  stubs(on, state)
+  expect(await $.tool.call({ tool: 'Bash', command: './gradlew build' })).toEqual({ result: 'ok' })
+  expect(state.ran).toEqual(['./gradlew build'])
+})
+
+test('at 77°C a new build starts at once', async ($, on) => {
+  const state = { tctl: 77, builds: '', saved: new Map(), ran: [] as string[] }
+  stubs(on, state)
+  expect(await $.tool.call({ tool: 'Bash', command: './gradlew build' })).toEqual({ result: 'ok' })
+})
+
+test('at 77°C a queued build stays held until the CPU is below 75°C', async ($, on) => {
+  const state = { tctl: 85, builds: '', saved: new Map(), ran: [] as string[] }
+  const clock = stubs(on, state)
+  const pending = $.tool.call({ tool: 'Bash', command: './gradlew test' })
+  await clock.settle()
+  state.tctl = 77
+  for (let i = 0; i < 5; i += 1) await clock.advance(3000)
+  expect(state.ran).toEqual([])
+  state.tctl = 74
+  await clock.advance(3000)
+  await clock.advance(3000)
+  expect(await pending).toEqual({ result: 'ok' })
+  expect(state.ran).toEqual(['./gradlew test'])
+})
+
+test('a build that waits longer than max_wait_minutes is refused', { options: { max_wait_minutes: 1 } }, async ($, on) => {
+  const state = { tctl: 90, builds: '', saved: new Map(), ran: [] as string[] }
+  const clock = stubs(on, state)
+  const pending = $.tool.call({ tool: 'Bash', command: './gradlew check' })
+  await clock.advance(70_000)
+  const r: any = await pending
+  expect(r.deny).toMatch(/waited too long/)
+  expect(state.ran).toEqual([])
+  expect(state.saved.get('queue')).toEqual([])
+})
+
+test('an interrupted wait gives its turn back, also for a second build of the same session', async ($, on) => {
+  const state: State = { tctl: 90, builds: '', saved: new Map(), ran: [] }
+  const clock = stubs(on, state)
+  const first = $.tool.call({ tool: 'Bash', command: './gradlew build' })
+  await clock.settle()
+  const second = $.tool.call({ tool: 'Bash', command: 'cargo test' })
+  await clock.settle()
+  expect((state.saved.get('queue') as any[]).length).toBe(2)
+  state.abort = true
+  await clock.advance(3000)
+  expect(((await first) as any).deny).toBeDefined()
+  expect(((await second) as any).deny).toBeDefined()
+  expect(state.saved.get('queue')).toEqual([])
+  expect(state.ran).toEqual([])
+})
+
+test('a ticket without a heartbeat stops holding the queue', async ($, on) => {
+  const state = { tctl: 62, builds: '', saved: new Map(), ran: [] as string[] }
+  const clock = stubs(on, state)
+  state.saved.set('queue', [{ id: 'gone', owner: 'other', since: 1_000_000 - 60_000, seen: 1_000_000 - 20_000, label: 'gradlew build' }])
+  expect(await $.tool.call({ tool: 'Bash', command: './gradlew build' })).toEqual({ result: 'ok' })
+  state.saved.set('lastStart', 0)
+  state.saved.set('queue', [{ id: 'quiet', owner: 'other', since: 1_000_000 - 60_000, seen: clock.now() - 5000, label: 'gradlew build' }])
+  const pending = $.tool.call({ tool: 'Bash', command: 'cargo build' })
+  const ui = await $.ui.mount(BAND)
+  expect(await waitFor(clock, ui, /1 queued ahead/)).toBeDefined()
+  expect(state.ran).toEqual(['./gradlew build'])
+  for (let i = 0; i < 5; i += 1) await clock.advance(3000)
+  expect(await pending).toEqual({ result: 'ok' })
+})
+
+test('a waiting build renews its ticket on every check', async ($, on) => {
+  const state = { tctl: 90, builds: '', saved: new Map(), ran: [] as string[] }
+  const clock = stubs(on, state)
+  const pending = $.tool.call({ tool: 'Bash', command: './gradlew build' })
+  await clock.advance(21_000)
+  const [ticket] = state.saved.get('queue') as any[]
+  expect(ticket.since).toBe(1_000_000)
+  expect(ticket.seen).toBeGreaterThanOrEqual(1_000_000 + 18_000)
+  state.tctl = 70
+  await clock.advance(3000)
+  await clock.advance(3000)
+  expect(await pending).toEqual({ result: 'ok' })
+})
+
+test('the turn is handed over under a lock, writing lastStart before the ticket goes', async ($, on) => {
+  const state: State = { tctl: 85, builds: '', saved: new Map(), ran: [], calls: [], writes: [] }
+  const clock = stubs(on, state)
+  const pending = $.tool.call({ tool: 'Bash', command: './gradlew build' })
+  await clock.settle()
+  state.tctl = 70
+  await clock.advance(3000)
+  await clock.advance(3000)
+  expect(await pending).toEqual({ result: 'ok' })
+  const writes = state.writes!
+  const started = writes.findIndex(([key]) => key === 'lastStart')
+  const dropped = writes.findIndex(([key, value]) => key === 'queue' && (value as any[]).length === 0)
+  expect(started).toBeGreaterThan(-1)
+  expect(started).toBeLessThan(dropped)
+  const calls = state.calls!
+  const locked = calls.findIndex((argv) => argv[0] === 'sh' && argv[2].includes('admit.lock'))
+  const unlocked = calls.findIndex((argv) => argv[0] === 'rmdir')
+  expect(locked).toBeGreaterThan(-1)
+  expect(calls[unlocked]).toEqual(['rmdir', '/data/heat-gate/admit.lock'])
+  expect(locked).toBeLessThan(unlocked)
+})
+
+test('while another session holds the admission lock the build waits its turn', async ($, on) => {
+  const state: State = { tctl: 62, builds: '', saved: new Map(), ran: [], lockBusy: true }
+  const clock = stubs(on, state)
+  const pending = $.tool.call({ tool: 'Bash', command: './gradlew build' })
+  await clock.settle()
+  expect(state.ran).toEqual([])
+  expect((state.saved.get('queue') as any[]).length).toBe(1)
+  state.lockBusy = false
+  await clock.advance(3000)
+  expect(await pending).toEqual({ result: 'ok' })
+})
+
+test('ending the session drops its tickets, and after /clear the band keeps refreshing', async ($, on) => {
+  const state = { tctl: 55, builds: '', saved: new Map(), ran: [] as string[], sensed: 0 }
+  const clock = stubs(on, state)
+  startStubs(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+  state.saved.set('queue', [
+    { id: 'mine', owner: 's1', since: 1_000_000, seen: 1_000_000, label: 'gradlew build' },
+    { id: 'theirs', owner: 's2', since: 1_000_000, seen: 1_000_000, label: 'cargo build' },
+  ])
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as any)
+  expect((state.saved.get('queue') as any[]).map((x) => x.id)).toEqual(['theirs'])
+  const before = state.sensed
+  await clock.advance(8000)
+  expect(state.sensed).toBeGreaterThan(before)
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 's1', resume: { id: 's1' } } as any)
+  const after = state.sensed
+  await clock.advance(8000)
+  expect(state.sensed).toBe(after)
+})
+
+test('at 98°C the builds freeze with a 10 minute guard, and they resume below 82°C', async ($, on) => {
+  const state: State = { tctl: 98, builds: '', saved: new Map(), ran: [], calls: [], pgrep: '4242\n4243\n' }
+  const clock = stubs(on, state)
+  startStubs(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+  const calls = state.calls!
+  const pgrep = calls.find((argv) => argv[0] === 'sh' && argv[2].includes('pgrep'))!
+  expect(pgrep[2]).toContain('pgrep -u "$(id -u)" -f')
+  expect(pgrep[4]).toBe(FREEZE_PATTERN)
+  expect(calls).toContainEqual(['kill', '-STOP', '4242', '4243'])
+  const guard = calls.find((argv) => argv[0] === 'sh' && argv[2].includes('setsid'))!
+  expect(guard[2]).toContain('nohup')
+  expect(guard.slice(3)).toEqual(['heat-gate-guard-1000000', '600', '4242', '4243'])
+  expect(state.saved.get('frozen')).toMatchObject({ pids: ['4242', '4243'], reason: 'auto', at: 1_000_000, guards: ['heat-gate-guard-1000000'] })
+  state.tctl = 83
+  await clock.advance(4000)
+  expect(calls.some((argv) => argv[1] === '-CONT')).toBe(false)
+  state.tctl = 81
+  await clock.advance(4000)
+  expect(calls).toContainEqual(['kill', '-CONT', '4242', '4243'])
+  expect(calls).toContainEqual(['pkill', '-f', '^sh -c sleep .* (heat-gate-guard-1000000) '])
+  expect(state.saved.has('frozen')).toBe(false)
+})
+
+test('a freeze lasts 10 minutes at most and a CPU still hot freezes again', async ($, on) => {
+  const state: State = { tctl: 99, builds: '', saved: new Map(), ran: [], calls: [], pgrep: '4242\n' }
+  const clock = stubs(on, state)
+  startStubs(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+  const stops = () => state.calls!.filter((argv) => argv[1] === '-STOP').length
+  expect(stops()).toBe(1)
+  await clock.advance(596_000)
+  expect(stops()).toBe(1)
+  await clock.advance(8000)
+  expect(state.calls).toContainEqual(['kill', '-CONT', '4242'])
+  expect(stops()).toBe(2)
+  expect((state.saved.get('frozen') as any).at).toBeGreaterThanOrEqual(1_600_000)
+})
+
+test('a second freeze keeps the pids of the first, and resuming never drops a newer freeze', async ($, on) => {
+  const state: State = { tctl: 60, builds: '', saved: new Map(), ran: [], calls: [], pgrep: '4242\n' }
+  const clock = stubs(on, state)
+  startStubs(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+  state.saved.set('frozen', { pids: ['7'], reason: 'auto', at: 999_000, heat: '99°C', guards: ['heat-gate-guard-999000'] })
+  const pane = await $.ui.mount(PANE)
+  await pane.press({ key: 'freeze' })
+  expect(state.saved.get('frozen')).toMatchObject({ pids: ['7', '4242'], reason: 'manual', guards: ['heat-gate-guard-999000', 'heat-gate-guard-1000000'] })
+  const newer = { pids: ['4242', '8'], reason: 'auto', at: 1_002_000, heat: '99°C', guards: ['heat-gate-guard-1002000'] }
+  state.onCont = () => {
+    state.onCont = undefined
+    state.saved.set('frozen', newer)
+  }
+  await clock.advance(4000)
+  await pane.press({ key: 'thaw' })
+  expect(state.calls).toContainEqual(['kill', '-CONT', '7', '4242'])
+  expect(state.saved.get('frozen')).toEqual(newer)
+})
+
 function startStubs(on: any) {
   on('session.start', () => ({ cwd: '/work' }))
+  on('session.end', () => ({ sessionId: 's1' }))
   on('session.id', () => ({ value: 's1' }))
   on('command.register', () => ({ value: undefined }))
 }

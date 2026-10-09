@@ -6,6 +6,8 @@ const GRACE_MS = 45_000;
 const POLL_SECONDS = "3";
 const DOCKER_MS = 2 * 60 * 1000;
 const DOCKER_CLAIM_MS = 30_000;
+const STALE_MS = 15_000;
+const GUARD_SECONDS = 600;
 const BARS = "▁▂▃▄▅▆▇█";
 
 const COLOR = { cool: "#87d7ff", ok: "#afd7af", warm: "#ffd787", hot: "#ffaf5f", fire: "#ff5f5f", accent: "#d787ff", dim: "#8a8a8a" };
@@ -148,14 +150,56 @@ const STRINGS = {
 const LEVEL_LIMITS = [60, 80, 90, 98, Infinity];
 const LEVEL_COLORS = [COLOR.cool, COLOR.ok, COLOR.warm, COLOR.hot, COLOR.fire];
 
-export const HEAVY =
-  /(?:^|[\s;&|(])(?:\.\/)?(?:gradlew|gradle|mvnw|mvn)\b(?=[^;&|]*\b(?:build|test|check|integrationTest|assemble|install|verify|package|bootRun|run|compile\w*|jacoco\w*|codenarc\w*|e2e\w*)\b)|\bcargo\s+(?:build|test|bench|run)\b|\bgo\s+(?:build|test)\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:build|test|e2e)\b|\bdocker(?:\s+buildx)?\s+build\b|\bdocker(?:-|\s+)compose\b[^;&|]*\bup\b|\bbazel\s+(?:build|test)\b/;
+const JAVA_MAIN = "^([^ ]*/)?java( .*)? ";
 
-// Every alternative starts with a word and a parenthesis or an escaped dot, so the
-// shell that receives the pattern as an argument never matches it with pgrep -f.
-const BUILD_PATTERN =
-  "org\\.gradle\\.wrapper\\.GradleWrapperMain|org\\.gradle\\.launcher\\.GradleMain|org\\.codehaus\\.plexus\\.classworlds\\.launcher\\.Launcher|cargo (build|test|bench|run)|go (build|test)|docker (buildx )?build|bazel(-real)? (build|test)";
-const FREEZE_PATTERN = "GradleDaemon|GradleWorkerMain|Gradle Test Executor|gradle\\.internal\\.worker|plexus\\.classworlds\\.launcher|(^|/)rustc |(^|/)cargo (build|test|bench)";
+// Every alternative is anchored to the executable at the start of the command line, so
+// the shell that receives the pattern as an argument never matches itself with pgrep -f.
+export const BUILD_PATTERN = [
+  `${JAVA_MAIN}org\\.gradle\\.wrapper\\.GradleWrapperMain( |$)`,
+  `${JAVA_MAIN}org\\.gradle\\.launcher\\.GradleMain( |$)`,
+  `${JAVA_MAIN}org\\.codehaus\\.plexus\\.classworlds\\.launcher\\.Launcher( |$)`,
+  "^([^ ]*/)?cargo( \\+[^ ]+)? (build|test|bench|run)( |$)",
+  "^([^ ]*/)?go (build|test)( |$)",
+  "^([^ ]*/)?docker(-buildx)? (buildx )?build( |$)",
+  "^([^ ]*/)?bazel(-real)? (build|test)( |$)",
+].join("|");
+
+export const FREEZE_PATTERN = [
+  `${JAVA_MAIN}org\\.gradle\\.launcher\\.daemon\\.bootstrap\\.GradleDaemon( |$)`,
+  `${JAVA_MAIN}worker\\.org\\.gradle\\.process\\.internal\\.worker\\.GradleWorkerMain( |$)`,
+  `${JAVA_MAIN}org\\.codehaus\\.plexus\\.classworlds\\.launcher\\.Launcher( |$)`,
+  "^([^ ]*/)?rustc( |$)",
+  "^([^ ]*/)?cargo( \\+[^ ]+)? (build|test|bench)( |$)",
+].join("|");
+
+const PGREP_MINE = 'exec pgrep -u "$(id -u)" -f "$1"';
+
+const GUARD = `
+if command -v setsid >/dev/null 2>&1; then
+  setsid sh -c 'sleep "$1"; shift; kill -CONT "$@"' "$0" "$@" </dev/null >/dev/null 2>&1 &
+else
+  nohup sh -c 'sleep "$1"; shift; kill -CONT "$@"' "$0" "$@" </dev/null >/dev/null 2>&1 &
+fi
+`;
+
+const LOCK = `
+d="\${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/data/heat-gate"
+l="$d/admit.lock"
+mkdir -p "$d" || exit 2
+i=0
+while [ "$i" -lt 30 ]; do
+  mkdir "$l" 2>/dev/null && { echo "$l"; exit 0; }
+  m=$(stat -c %Y "$l" 2>/dev/null || stat -f %m "$l" 2>/dev/null)
+  if [ -n "$m" ] && [ $(( $(date +%s) - m )) -gt 10 ]; then
+    mv "$l" "$l.$$" 2>/dev/null && rm -rf "$l.$$"
+  else
+    sleep 0.1
+  fi
+  i=$((i + 1))
+done
+[ -d "$l" ] && exit 1
+exit 2
+`;
 
 const SENSE = `
 if [ "$(uname -s)" = Darwin ]; then
@@ -232,6 +276,9 @@ let held = null;
 let frozen = null;
 let queue = [];
 let stopTimer = null;
+let ticking = false;
+let gate = Promise.resolve();
+let serial = 0;
 let sessionId = "";
 let surface = "terminal";
 let containers = null;
@@ -249,7 +296,7 @@ export function configure(options) {
 }
 
 export function isHeavy(command) {
-  return HEAVY.test(command) || (extraHeavy !== null && extraHeavy.test(command));
+  return segmentsOf(command).some((words) => jobIn(words) !== null) || (extraHeavy !== null && extraHeavy.test(command));
 }
 
 export function register(on, options) {
@@ -264,21 +311,24 @@ export function register(on, options) {
       sessionId = String(Math.random()).slice(2);
     }
     await tick($);
+    stopTimer?.();
     const timer = $.clock.every(TICK_MS, () => tick($));
     stopTimer = typeof timer === "function" ? timer : () => timer?.cancel?.();
     try {
       await $.command.register({ name: "heat", description: L.commandDescription, immediate: true });
-    } catch {
-      // the name is taken: the band still works
-    }
+    } catch {}
     return result;
   });
 
   on("session.end", async ($, e, next) => {
-    stopTimer?.();
-    if (held !== null) {
-      await dropTicket($, held.ticket);
+    if (e.reason !== "clear" && e.reason !== "resume") {
+      stopTimer?.();
+      stopTimer = null;
     }
+    const ending = new Set([e.sessionId, sessionId].filter(Boolean));
+    try {
+      await dropTickets($, (x) => ending.has(x.owner));
+    } catch {}
     return next(e);
   });
 
@@ -295,23 +345,26 @@ export function register(on, options) {
     }
     await sense($);
     const now = await $.clock.now();
-    const reason = await blocker($, now, null);
+    const reason = await admit($, now, null);
     if (reason === null) {
-      await $.store.set("lastStart", now);
       return next(e);
     }
 
-    const mine = { ticket: `${sessionId}-${now}`, command, label: labelOf(command), since: now, reason, decision: null };
-    await addTicket($, mine);
-    while (held !== null) {
-      await $.process.run(["sleep", POLL_SECONDS], { timeoutMs: 10_000 });
-    }
-    held = mine;
-
+    sessionId = await currentSession($);
+    serial += 1;
+    const mine = { ticket: `${sessionId}-${now}-${serial}`, owner: sessionId, command, label: labelOf(command), since: now, reason, decision: null };
     try {
-      await $.ui.open({ id: PANE, title: "heat-gate", rows: 18 });
-      $.ui.status(L.statusQueued(mine.label, mine.reason));
-      $.ui.invalidate("ui.render");
+      await beat($, mine);
+      while (held !== null && !next.signal.aborted) {
+        await $.process.run(["sleep", POLL_SECONDS], { timeoutMs: 10_000 });
+        await beat($, mine);
+      }
+      if (!next.signal.aborted) {
+        held = mine;
+        await $.ui.open({ id: PANE, title: "heat-gate", rows: 18 });
+        $.ui.status(L.statusQueued(mine.label, mine.reason));
+        $.ui.invalidate("ui.render");
+      }
 
       // A hook's own time is capped at 10 s, but time spent inside a $ call is not,
       // so the hold waits on short sleeps until the CPU cools or a button decides.
@@ -320,32 +373,40 @@ export function register(on, options) {
           mine.decision = "interrupted";
           break;
         }
-        const t = await $.clock.now();
-        if (t - mine.since > cfg.max_wait_minutes * 60_000) {
+        if ((await $.clock.now()) - mine.since > cfg.max_wait_minutes * 60_000) {
           mine.decision = "timeout";
           break;
         }
         await $.process.run(["sleep", POLL_SECONDS], { timeoutMs: 10_000 });
+        if (mine.decision !== null) {
+          break;
+        }
         await sense($);
-        mine.reason = await blocker($, t, mine.ticket);
+        mine.reason = await admit($, await $.clock.now(), mine);
         if (mine.reason === null) {
           mine.decision = "auto";
+        } else {
+          await beat($, mine);
         }
         $.ui.invalidate("ui.render");
       }
+      if (mine.decision === "force") {
+        await $.store.set("lastStart", await $.clock.now());
+      }
     } catch {
-      mine.decision = mine.decision ?? "error";
+      mine.decision = mine.decision ?? (next.signal.aborted ? "interrupted" : "error");
     } finally {
-      await dropTicket($, mine.ticket);
       if (held === mine) {
         held = null;
       }
+      try {
+        await dropTickets($, (x) => x.id === mine.ticket);
+      } catch {}
       $.ui.status(undefined);
       $.ui.invalidate("ui.render");
     }
 
     if (mine.decision === "auto" || mine.decision === "force") {
-      await $.store.set("lastStart", await $.clock.now());
       const h = heatLabel(last());
       $.ui.toast(mine.decision === "force" ? L.toastForced(h) : L.toastReleased(h));
       return next(e);
@@ -373,16 +434,27 @@ export function register(on, options) {
 }
 
 async function tick($) {
-  await sharedSense($);
-  await dockerSense($);
-  await guardFreeze($);
-  try {
-    const stored = await $.store.get("queue");
-    queue = Array.isArray(stored) ? stored : [];
-  } catch {
-    queue = [];
+  if (ticking) {
+    return;
   }
-  $.ui.invalidate("ui.render");
+  ticking = true;
+  try {
+    await sharedSense($);
+    await dockerSense($);
+    await guardFreeze($);
+    queue = await liveTickets($, await $.clock.now());
+    $.ui.invalidate("ui.render");
+  } finally {
+    ticking = false;
+  }
+}
+
+async function currentSession($) {
+  try {
+    return (await $.session.id()) || sessionId;
+  } catch {
+    return sessionId;
+  }
 }
 
 async function sense($) {
@@ -402,9 +474,7 @@ async function sense($) {
   adopt({ sample: parsed.sample, builds: parsed.builds, hogs: parsed.hogs, cpu: cpuPrev });
   try {
     await $.store.set("sense", { at: parsed.sample.at, sample: parsed.sample, builds, hogs, cpu: cpuPrev });
-  } catch {
-    // the next tick publishes again
-  }
+  } catch {}
 }
 
 function adopt(reading) {
@@ -548,7 +618,9 @@ export function parseSense(stdout) {
       mem = total > 0 ? { used: total - avail, total, swapUsed: (swapTotal || 0) - (swapFree || 0), swapTotal: swapTotal || 0 } : null;
     } else if (line.startsWith("B\t")) {
       const [, pid, etimes, stat, cwd, args] = line.split("\t");
-      found.push({ pid: Number(pid), seconds: secondsOf(etimes), stopped: /T/.test(stat ?? ""), cwd: cwd ?? "", job: jobOf(args ?? "") });
+      if (!isContinuous(args ?? "")) {
+        found.push({ pid: Number(pid), seconds: secondsOf(etimes), stopped: /T/.test(stat ?? ""), cwd: cwd ?? "", job: jobOf(args ?? "") });
+      }
     } else if (line.startsWith("P\t")) {
       const [, pcpu, comm] = line.split("\t");
       top.push({ pcpu: Number(pcpu) || 0, comm: comm ?? "" });
@@ -561,6 +633,7 @@ export function parseSense(stdout) {
 }
 
 const VALUE_FLAGS = new Set(["-x", "--exclude-task", "-p", "--project-dir", "-b", "--build-file", "-c", "--settings-file", "-g", "--gradle-user-home", "-I", "--init-script", "--console", "--warning-mode", "-P", "-pl", "--projects", "-f", "--file", "-s", "--settings", "-T", "--threads", "-rf", "--resume-from"]);
+const TASK_VALUE_FLAGS = new Set([...VALUE_FLAGS, "--tests", "--configuration", "--dependency"]);
 
 function testClass(pattern) {
   const clean = String(pattern).replace(/['"]/g, "");
@@ -596,6 +669,28 @@ export function jobOf(args) {
     return `${other[1]} ${other[2]}`;
   }
   return tasksIn(text.split(/\s+/).map((w, i) => (i === 0 ? w.split("/").pop() : w)).join(" "));
+}
+
+const CONTINUOUS = new Set(["run", "bootRun", "quarkusDev", "quarkus:dev"]);
+
+export function isContinuous(args) {
+  const text = String(args).trim();
+  if (/(?:^|\/)cargo(?:\s+\+\S+)?\s+run(?:\s|$)/.test(text)) {
+    return true;
+  }
+  const jvm = text.match(/(GradleWrapperMain|GradleMain|classworlds\.launcher\.Launcher)(?:\s+(.*))?$/);
+  if (!jvm) {
+    return false;
+  }
+  const gradle = !jvm[1].endsWith("Launcher");
+  const words = String(jvm[2] ?? "").split(/\s+/);
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (gradle && (w === "-t" || w === "--continuous")) return true;
+    if (TASK_VALUE_FLAGS.has(w)) i++;
+    else if (!w.startsWith("-") && (CONTINUOUS.has(w) || CONTINUOUS.has(w.split(":").pop()))) return true;
+  }
+  return false;
 }
 
 export function projectOf(cwd) {
@@ -673,12 +768,57 @@ async function blocker($, now, ticket) {
   }
   const tickets = await liveTickets($, now);
   if (ticket !== null && tickets.length > 0 && tickets[0].id !== ticket) {
-    return L.reasonTurn(tickets.findIndex((x) => x.id === ticket) + 1, tickets.length);
+    const at = tickets.findIndex((x) => x.id === ticket);
+    return at === -1 ? L.reasonAhead(tickets.length) : L.reasonTurn(at + 1, tickets.length);
   }
   if (ticket === null && tickets.length > 0) {
     return L.reasonAhead(tickets.length);
   }
   return null;
+}
+
+async function admit($, now, mine) {
+  const ticket = mine === null ? null : mine.ticket;
+  const reason = await blocker($, now, ticket);
+  if (reason !== null) {
+    return reason;
+  }
+  return exclusive($, L.reasonJustStarted, async () => {
+    const still = await blocker($, now, ticket);
+    if (still === null) {
+      await $.store.set("lastStart", now);
+      if (ticket !== null) {
+        await dropTickets($, (x) => x.id === ticket);
+      }
+    }
+    return still;
+  });
+}
+
+function exclusive($, busy, fn) {
+  const turn = gate.then(async () => {
+    let lock = null;
+    try {
+      const run = await $.process.run(["sh", "-c", LOCK, "heat-gate"], { timeoutMs: 8000 });
+      if (run.exitCode === 1) {
+        return busy;
+      }
+      lock = run.exitCode === 0 ? run.stdout.trim() : null;
+    } catch {
+      lock = null;
+    }
+    try {
+      return await fn();
+    } finally {
+      if (lock) {
+        try {
+          await $.process.run(["rmdir", lock], { timeoutMs: 5000 });
+        } catch {}
+      }
+    }
+  });
+  gate = turn.catch(() => undefined);
+  return turn;
 }
 
 async function liveTickets($, now) {
@@ -688,23 +828,32 @@ async function liveTickets($, now) {
   } catch {
     stored = [];
   }
-  const live = (Array.isArray(stored) ? stored : []).filter((x) => now - x.since < (cfg.max_wait_minutes + 10) * 60_000);
+  const live = (Array.isArray(stored) ? stored : []).filter((x) => now - (x.seen ?? x.since) < STALE_MS);
   return live.sort((a, b) => a.since - b.since);
 }
 
-async function addTicket($, mine) {
+async function beat($, mine) {
   const now = await $.clock.now();
-  const live = await liveTickets($, now);
-  live.push({ id: mine.ticket, since: mine.since, label: mine.label });
+  const live = (await liveTickets($, now)).filter((x) => x.id !== mine.ticket);
+  live.push({ id: mine.ticket, owner: mine.owner, since: mine.since, seen: now, label: mine.label });
+  queue = live.sort((a, b) => a.since - b.since);
+  await $.store.set("queue", queue);
+}
+
+async function dropTickets($, drop) {
+  const live = (await liveTickets($, await $.clock.now())).filter((x) => !drop(x));
   queue = live;
   await $.store.set("queue", live);
 }
 
-async function dropTicket($, id) {
-  const now = await $.clock.now();
-  const live = (await liveTickets($, now)).filter((x) => x.id !== id);
-  queue = live;
-  await $.store.set("queue", live);
+async function storedFreeze($) {
+  let stored = null;
+  try {
+    stored = await $.store.get("frozen");
+  } catch {
+    stored = null;
+  }
+  return stored && Array.isArray(stored.pids) && stored.pids.length > 0 ? stored : null;
 }
 
 async function guardFreeze($) {
@@ -712,24 +861,21 @@ async function guardFreeze($) {
   if (s === null) {
     return;
   }
-  let stored = null;
-  try {
-    stored = await $.store.get("frozen");
-  } catch {
-    stored = null;
+  frozen = await storedFreeze($);
+  if (frozen !== null && (await $.clock.now()) - frozen.at >= GUARD_SECONDS * 1000) {
+    await thaw($, false);
   }
-  frozen = stored && Array.isArray(stored.pids) && stored.pids.length > 0 ? stored : null;
   if (frozen === null && cfg.freeze_enabled && shouldFreeze(s)) {
     await freeze($, "auto");
   } else if (frozen !== null && frozen.reason === "auto" && canThaw(s)) {
-    await thaw($);
+    await thaw($, true);
   }
 }
 
 async function freeze($, reason) {
   let run;
   try {
-    run = await $.process.run(["pgrep", "-f", FREEZE_PATTERN], { timeoutMs: 5000 });
+    run = await $.process.run(["sh", "-c", PGREP_MINE, "heat-gate", FREEZE_PATTERN], { timeoutMs: 5000 });
   } catch {
     return;
   }
@@ -738,25 +884,42 @@ async function freeze($, reason) {
     return;
   }
   await $.process.run(["kill", "-STOP", ...pids], { timeoutMs: 5000 });
-  frozen = { pids, reason, at: await $.clock.now(), heat: heatLabel(last()) };
+  const at = await $.clock.now();
+  const guard = `heat-gate-guard-${at}`;
+  try {
+    await $.process.run(["sh", "-c", GUARD, guard, String(GUARD_SECONDS), ...pids], { timeoutMs: 5000 });
+  } catch {}
+  const before = await storedFreeze($);
+  frozen = { pids: [...new Set([...(before?.pids ?? []), ...pids])], reason, at, heat: heatLabel(last()), guards: [...(before?.guards ?? []), guard] };
   await $.store.set("frozen", frozen);
   $.ui.toast(L.froze(pids.length, frozen.heat), { timeoutMs: 10_000 });
   $.ui.log(L.frozeLog(pids.length, frozen.heat, thawRule()));
 }
 
-async function thaw($) {
-  if (frozen === null) {
+async function thaw($, announce) {
+  const current = await storedFreeze($);
+  if (current === null) {
+    frozen = null;
     return;
   }
-  const pids = frozen.pids;
   try {
-    await $.process.run(["kill", "-CONT", ...pids], { timeoutMs: 5000 });
-  } catch {
-    // some pids already exited
+    await $.process.run(["kill", "-CONT", ...current.pids], { timeoutMs: 5000 });
+  } catch {}
+  if (Array.isArray(current.guards) && current.guards.length > 0) {
+    try {
+      await $.process.run(["pkill", "-f", `^sh -c sleep .* (${current.guards.join("|")}) `], { timeoutMs: 5000 });
+    } catch {}
+  }
+  const after = await storedFreeze($);
+  if (after !== null && after.at !== current.at) {
+    frozen = after;
+    return;
   }
   frozen = null;
   await $.store.delete("frozen");
-  $.ui.toast(L.resumed(heatLabel(last())));
+  if (announce) {
+    $.ui.toast(L.resumed(heatLabel(last())));
+  }
 }
 
 function last() {
@@ -807,14 +970,113 @@ function human(bytes) {
   return bytes >= 1024 ** 3 ? `${gb(bytes)} GB` : `${Math.round(bytes / 1024 ** 2)} MB`;
 }
 
-export function labelOf(command) {
-  const jvm = command.match(/(?:\.\/)?(gradlew|gradle|mvnw|mvn)\b([^;&|]*)/);
-  if (jvm) {
-    const tasks = jvm[2].split(/\s+/).filter((w) => w && !w.startsWith("-") && !w.includes("=")).slice(0, 3).join(" ");
-    return `${jvm[1]} ${tasks}`.trim();
+const SEPARATORS = new Set([";", "&", "|", "\n", "(", ")", "<", ">", "`"]);
+const KEYWORDS = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"]);
+const WRAPPERS = new Set(["sudo", "env", "nice", "nohup", "timeout", "time", "exec", "command", "ionice", "stdbuf", "caffeinate"]);
+const WRAPPER_VALUES = new Set(["-n", "-s", "-k", "-u", "-g", "-c", "-C", "-t", "-a", "--signal", "--kill-after", "--adjustment", "--unset", "--chdir", "--user"]);
+const JVM_TOOLS = new Set(["gradlew", "gradle", "mvnw", "mvn"]);
+const HEAVY_TASK = /^(?:build|test|check|integrationTest|assemble|install|verify|package|bootRun|run|compile\w*|jacoco\w*|codenarc\w*|e2e\w*)$/;
+
+function segmentsOf(command) {
+  const text = String(command);
+  const segments = [];
+  let words = [];
+  let word = "";
+  let open = false;
+  let quote = null;
+  const endWord = () => {
+    if (open) words.push(word);
+    word = "";
+    open = false;
+  };
+  const endSegment = () => {
+    endWord();
+    if (words.length > 0) segments.push(words);
+    words = [];
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+      else if (ch === "\\" && quote === '"' && i + 1 < text.length) word += text[++i];
+      else word += ch;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      open = true;
+    } else if (ch === "\\") {
+      i += 1;
+      if (i < text.length && text[i] !== "\n") {
+        word += text[i];
+        open = true;
+      }
+    } else if (SEPARATORS.has(ch)) {
+      if ((ch === "<" || ch === ">") && /^\d+$/.test(word)) open = false;
+      endSegment();
+    } else if (/\s/.test(ch)) {
+      endWord();
+    } else {
+      word += ch;
+      open = true;
+    }
   }
-  const other = command.match(/\b(cargo\s+\w+|go\s+(?:build|test)|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?\w+|docker(?:\s+buildx)?\s+build|docker(?:-|\s+)compose\b[^;&|]*\bup|bazel\s+\w+)/);
-  return other ? other[1].replace(/\s+/g, " ").replace(/^docker(-| )compose.*\bup$/, "docker compose up") : command.slice(0, 40);
+  endSegment();
+  return segments;
+}
+
+function programOf(words) {
+  let i = 0;
+  while (i < words.length) {
+    const w = words[i];
+    if (KEYWORDS.has(w) || /^[A-Za-z_]\w*=/.test(w)) {
+      i += 1;
+    } else if (WRAPPERS.has(w)) {
+      i += 1;
+      while (i < words.length && words[i].startsWith("-")) i += WRAPPER_VALUES.has(words[i]) ? 2 : 1;
+      if (w === "timeout") i += 1;
+    } else {
+      return { tool: w.split("/").pop(), args: words.slice(i + 1) };
+    }
+  }
+  return null;
+}
+
+function jobIn(words) {
+  const found = programOf(words);
+  if (found === null) {
+    return null;
+  }
+  const { tool, args } = found;
+  if (JVM_TOOLS.has(tool)) {
+    const tasks = [];
+    for (let i = 0; i < args.length; i++) {
+      if (TASK_VALUE_FLAGS.has(args[i])) i++;
+      else if (!args[i].startsWith("-") && !args[i].includes("=")) tasks.push(args[i]);
+    }
+    return tasks.some((t) => t.split(/[:-]/).some((part) => HEAVY_TASK.test(part))) ? `${tool} ${tasks.slice(0, 3).join(" ")}` : null;
+  }
+  const subs = args.filter((w) => !w.startsWith("-") && !w.startsWith("+"));
+  const [first, second] = subs;
+  if (tool === "cargo" && ["build", "test", "bench", "run"].includes(first)) return `cargo ${first}`;
+  if (tool === "go" && ["build", "test"].includes(first)) return `go ${first}`;
+  if (["npm", "pnpm", "yarn", "bun"].includes(tool)) {
+    const script = first === "run" || first === "run-script" ? second : first;
+    return /^(?:build|test|e2e)\b/.test(script ?? "") ? `${tool} ${script === first ? "" : `${first} `}${script}` : null;
+  }
+  if (tool === "docker" && first === "build") return "docker build";
+  if (tool === "docker" && first === "buildx" && second === "build") return "docker buildx build";
+  if ((tool === "docker" && first === "compose") || tool === "docker-compose") return subs.includes("up") ? "docker compose up" : null;
+  if (["bazel", "bazelisk"].includes(tool) && ["build", "test"].includes(first)) return `bazel ${first}`;
+  return null;
+}
+
+export function labelOf(command) {
+  for (const words of segmentsOf(command)) {
+    const job = jobIn(words);
+    if (job !== null) {
+      return job;
+    }
+  }
+  return command.slice(0, 40);
 }
 
 function shortPath(path) {
@@ -1083,7 +1345,7 @@ function pane(t, where, columns, $) {
   const buttons = [
     frozen === null
       ? Button({ key: "freeze", label: L.freeze, hotkey: "f", plain: true, onPress: () => freeze($, "manual") })
-      : Button({ key: "thaw", label: L.thaw, hotkey: "r", plain: true, onPress: () => thaw($) }),
+      : Button({ key: "thaw", label: L.thaw, hotkey: "r", plain: true, onPress: () => thaw($, true) }),
   ];
   if (s.boost === true) {
     buttons.push(Button({ key: "copy", label: L.copyTurbo, hotkey: "t", plain: true, onPress: () => $.ui.copy(turboCommand(s.boostPath)) }));
