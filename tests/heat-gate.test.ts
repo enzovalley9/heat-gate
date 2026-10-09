@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { bandPlan, bytesOf, cellsOf, configure, cpuPercent, isHeavy, labelOf, levelOf, meter, jobOf, parseDocker, parseSense, projectOf, turboCommand } from '../hooks/heat-gate.mjs'
+import { bandPlan, bytesOf, canThaw, cellsOf, configure, cpuPercent, heatLabel, isHeavy, labelOf, levelOf, meter, jobOf, parseDocker, parseSense, pressureOf, projectOf, secondsOf, shouldFreeze, tooHot, turboCommand } from '../hooks/heat-gate.mjs'
 
 const sense = (tctl: number, builds = '') =>
   `S ${tctl * 1000} ${tctl * 1000} 105000 1 7.40 16 /sys/devices/system/cpu/cpufreq/boost\n${builds}P\t227\tjava\nP\t96\tnode\n`
@@ -71,13 +71,44 @@ test('reads CPU, memory and containers', () => {
   expect(meter(50, 6)).toBe('▰▰▰▱▱▱')
 })
 
-function stubs(on: any, state: { tctl: number; builds: string; saved: Map<string, unknown>; ran: string[]; docker?: number; sensed?: number }) {
+test('reads a Mac: thermal pressure, degrees when macmon is there, BSD elapsed times', () => {
+  const out = parseSense('D x 2 3.20 10\nU 35.5\nM 16777216 6291456 2097152 1048576\nB\t812\t01:02:03\tS\t/Users/alex/payments-api\tjava -cp gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain test\nP\t180.2\tjava\n')
+  expect(out.sample).toMatchObject({ tctl: null, crit: null, boost: null, pressure: 2, load: 3.2, ncpu: 10 })
+  expect(out.usage).toBe(35.5)
+  expect(out.sample.mem.total).toBe(16 * 1024 ** 3)
+  expect(out.builds[0]).toMatchObject({ pid: 812, seconds: 3723, cwd: '/Users/alex/payments-api', job: 'gradle test' })
+  expect(parseSense('D 64.5 0 1.0 8\n').sample).toMatchObject({ tctl: 64.5, pressure: 0 })
+  expect(secondsOf('2-03:04:05')).toBe(2 * 86400 + 3 * 3600 + 4 * 60 + 5)
+  expect(secondsOf('04:05')).toBe(245)
+  expect(secondsOf('97')).toBe(97)
+  expect([pressureOf('0'), pressureOf('3'), pressureOf('30'), pressureOf('x'), pressureOf(undefined)]).toEqual([0, 3, 2, null, null])
+})
+
+test('on a Mac the thermal pressure decides, not the degrees', () => {
+  configure({ language: 'es' })
+  const mac = (pressure: number, tctl: number | null = null) => ({ tctl, pressure, crit: null })
+  expect(tooHot(mac(0, 95), 80)).toBe(false)
+  expect(tooHot(mac(1), 80)).toBe(true)
+  expect(shouldFreeze(mac(1))).toBe(false)
+  expect(shouldFreeze(mac(2))).toBe(true)
+  expect(canThaw(mac(1))).toBe(false)
+  expect(canThaw(mac(0))).toBe(true)
+  expect(heatLabel(mac(2))).toBe('presión alta')
+  expect(heatLabel(mac(0, 64.4))).toBe('64°C')
+  expect(tooHot({ tctl: 85, crit: 105 }, 80)).toBe(true)
+  configure({})
+})
+
+function stubs(on: any, state: { tctl: number; builds: string; saved: Map<string, unknown>; ran: string[]; docker?: number; sensed?: number; pressure?: number }) {
   const clock = mock.clock(on, { now: 1_000_000 })
   let busy = 1000
   on('process.run', async ($: any, e: any) => {
     if (e.argv[0] === 'bash') {
       state.sensed = (state.sensed ?? 0) + 1
       busy += 400
+      if (state.pressure !== undefined) {
+        return { value: { exitCode: 0, stdout: `D x ${state.pressure} 3.20 10\nU 35.0\nM 16777216 6291456 2097152 1048576\n${state.builds}P\t180\tjava\n`, stderr: '' } }
+      }
       return { value: { exitCode: 0, stdout: `${sense(state.tctl, state.builds)}C ${busy} ${busy + 600}\nM 32000000 12000000 8000000 6000000\n`, stderr: '' } }
     }
     if (e.argv[0] === 'docker') {
@@ -147,6 +178,35 @@ test('the queued build starts by itself once the CPU cools down', async ($, on) 
   await clock.advance(3000)
   await clock.advance(3000)
   expect(await pending).toEqual({ result: 'ok' })
+})
+
+test('on a Mac a moderate pressure holds the build until it is back to normal', async ($, on) => {
+  const state = { tctl: 0, builds: '', saved: new Map(), ran: [] as string[], pressure: 1 }
+  const clock = stubs(on, state)
+  const pending = $.tool.call({ tool: 'Bash', command: './gradlew test' })
+  await clock.settle()
+  expect(state.ran).toEqual([])
+  state.pressure = 0
+  await clock.advance(3000)
+  await clock.advance(3000)
+  expect(await pending).toEqual({ result: 'ok' })
+})
+
+test('on a Mac the band and the pane show the pressure, never a made-up temperature', { options: { language: 'es' } }, async ($, on) => {
+  const state = { tctl: 0, builds: '', saved: new Map(), ran: [] as string[], pressure: 2 }
+  const clock = stubs(on, state)
+  startStubs(on)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    await $.session.start({ surface, isInteractive: true, cwd: '/work' } as any)
+    await clock.advance(9000)
+    const band = await $.ui.mount({ ...BAND, surface })
+    expect(await band.find({ type: 'Text', text: /presión alta/ })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: /°C/ })).toBeUndefined()
+    const pane = await $.ui.mount({ plugin: 'heat-gate', component: 'Pane', surface, requestId: 'heat-gate', viewport: { columns: 160, rows: 50 }, props: { title: 'heat-gate', isFocused: true, bodyColumns: 120, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } } as any)
+    expect(await pane.find({ type: 'Text', text: /presión térmica de macOS · carga 3.2\/10/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /mientras la presión térmica de macOS no sea normal/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /°C/ })).toBeUndefined()
+  }
 })
 
 test('another running build makes it wait and "Cancel" refuses it', async ($, on) => {

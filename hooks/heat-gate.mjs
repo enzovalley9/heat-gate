@@ -11,6 +11,8 @@ const BARS = "▁▂▃▄▅▆▇█";
 
 const COLOR = { cool: "#87d7ff", ok: "#afd7af", warm: "#ffd787", hot: "#ffaf5f", fire: "#ff5f5f", accent: "#d787ff", dim: "#8a8a8a" };
 
+const PRESSURE_COLORS = [COLOR.ok, COLOR.warm, COLOR.hot, COLOR.fire, COLOR.fire];
+
 const DEFAULTS = { language: "en", hold_above: 80, release_below: 75, freeze_enabled: true, freeze_at: 98, thaw_below: 82, max_wait_minutes: 30, extra_build_pattern: "" };
 
 const STRINGS = {
@@ -27,11 +29,16 @@ const STRINGS = {
     waitingFor: "Waiting   ",
     command: "Command   ",
     checking: "checking…",
-    heldRule: (cool, max) => `Starts by itself once the CPU is below ${cool}°C and no other build runs. ${max} min at most.`,
+    heldRule: (until, max) => `Starts by itself once ${until} and no other build runs. ${max} min at most.`,
+    coolerThan: (t) => `the CPU is below ${t}°C`,
+    pressureNormal: "the thermal pressure is back to normal",
     runNow: "Run now",
     cancel: "Cancel",
     reading: "Reading sensors…",
     critical: (c, load, n) => `hardware shutdown at ${c}°C · load ${load}/${n}`,
+    criticalMac: (load, n) => `macOS thermal pressure · load ${load}/${n}`,
+    pressure: ["normal", "moderate", "high", "critical", "critical"],
+    pressureShort: (word) => `pressure ${word}`,
     runningBuilds: "Running builds",
     none: "  none",
     frozenSuffix: " · frozen",
@@ -42,24 +49,26 @@ const STRINGS = {
     thaw: "Resume builds",
     copyTurbo: "Copy the command that turns turbo off",
     rules: (c) => `Holds builds from ${c.hold_above}°C · releases below ${c.release_below}°C${c.freeze_enabled ? ` · freezes at ${c.freeze_at}°C and resumes below ${c.thaw_below}°C` : ""}`,
+    rulesMac: (c) => `Holds builds while the macOS thermal pressure is above normal${c.freeze_enabled ? " · freezes them when it is high and resumes them when it is back to normal" : ""}`,
     lastMinutes: (m) => `last ${m} min`,
     chartAlt: (t) => `CPU temperature over the last minutes, now ${t} degrees`,
     reasonFrozen: "builds are frozen because of the temperature",
-    reasonHot: (t) => `CPU at ${t}°C`,
+    reasonHot: (h) => `CPU at ${h}`,
+    reasonPressure: (word) => `macOS thermal pressure ${word}`,
     reasonBusy: (n, where) => `${n === 1 ? "another build" : `${n} builds`} running (${where})`,
     reasonJustStarted: "another build just started",
     reasonTurn: (i, n) => `turn ${i} of ${n} in the queue`,
     reasonAhead: (n) => `${n} queued ahead`,
     statusQueued: (label, why) => `queued: ${label} (${why})`,
-    toastForced: (t) => `heat-gate: started without waiting (${t}°C)`,
-    toastReleased: (t) => `heat-gate: your turn, starting at ${t}°C`,
+    toastForced: (h) => `heat-gate: started without waiting (${h})`,
+    toastReleased: (h) => `heat-gate: your turn, starting (${h})`,
     deny: (why, reason) => `heat-gate did not start this build: ${why}. It was waiting because: ${reason}. Do not start it again on your own: tell the user and wait until they ask.`,
     why: { cancel: "the user cancelled it in the heat-gate pane", timeout: "it waited too long while the CPU stayed busy or hot", interrupted: "the turn was interrupted while it waited", error: "heat-gate failed while holding it" },
     noDecision: "there was no decision",
     loadOrHeat: "load or temperature",
-    froze: (n, t) => `heat-gate: froze ${n} build processes at ${t}°C to avoid a thermal shutdown`,
-    frozeLog: (n, t, thaw) => `builds frozen at ${t}°C (${n} processes). They resume by themselves below ${thaw}°C.`,
-    resumed: (t) => `heat-gate: builds resumed (${t}°C)`,
+    froze: (n, h) => `heat-gate: froze ${n} build processes (${h}) to avoid a thermal shutdown`,
+    frozeLog: (n, h, until) => `builds frozen (${h}, ${n} processes). They resume by themselves once ${until}.`,
+    resumed: (h) => `heat-gate: builds resumed (${h})`,
     memory: "Memory",
     threads: (load, n) => `load ${load} · ${n} threads`,
     swap: (used, total) => `swap ${used}/${total} GB`,
@@ -84,11 +93,16 @@ const STRINGS = {
     waitingFor: "Espera    ",
     command: "Comando   ",
     checking: "comprobando…",
-    heldRule: (cool, max) => `Se lanza sola cuando la CPU baje de ${cool}°C y no haya otra build. Máximo ${max} min.`,
+    heldRule: (until, max) => `Se lanza sola cuando ${until} y no haya otra build. Máximo ${max} min.`,
+    coolerThan: (t) => `la CPU baje de ${t}°C`,
+    pressureNormal: "la presión térmica vuelva a normal",
     runNow: "Lanzar ya",
     cancel: "Cancelar",
     reading: "Leyendo sensores…",
     critical: (c, load, n) => `apagado del hardware a ${c}°C · carga ${load}/${n}`,
+    criticalMac: (load, n) => `presión térmica de macOS · carga ${load}/${n}`,
+    pressure: ["normal", "moderada", "alta", "crítica", "crítica"],
+    pressureShort: (word) => `presión ${word}`,
     runningBuilds: "Builds en marcha",
     none: "  ninguna",
     frozenSuffix: " · congelada",
@@ -99,24 +113,26 @@ const STRINGS = {
     thaw: "Reanudar builds",
     copyTurbo: "Copiar comando para quitar el turbo",
     rules: (c) => `Retiene builds desde ${c.hold_above}°C · las libera bajo ${c.release_below}°C${c.freeze_enabled ? ` · congela a ${c.freeze_at}°C y reanuda bajo ${c.thaw_below}°C` : ""}`,
+    rulesMac: (c) => `Retiene builds mientras la presión térmica de macOS no sea normal${c.freeze_enabled ? " · las congela cuando es alta y las reanuda cuando vuelve a normal" : ""}`,
     lastMinutes: (m) => `últimos ${m} min`,
     chartAlt: (t) => `Temperatura de la CPU en los últimos minutos, ahora ${t} grados`,
     reasonFrozen: "hay builds congeladas por temperatura",
-    reasonHot: (t) => `CPU a ${t}°C`,
+    reasonHot: (h) => `CPU a ${h}`,
+    reasonPressure: (word) => `presión térmica de macOS ${word}`,
     reasonBusy: (n, where) => `${n === 1 ? "otra build" : `${n} builds`} en marcha (${where})`,
     reasonJustStarted: "otra build acaba de arrancar",
     reasonTurn: (i, n) => `turno ${i} de ${n} en la cola`,
     reasonAhead: (n) => `hay ${n} en cola antes`,
     statusQueued: (label, why) => `en cola: ${label} (${why})`,
-    toastForced: (t) => `heat-gate: lanzada sin esperar (${t}°C)`,
-    toastReleased: (t) => `heat-gate: turno libre, lanzando a ${t}°C`,
+    toastForced: (h) => `heat-gate: lanzada sin esperar (${h})`,
+    toastReleased: (h) => `heat-gate: turno libre, lanzando (${h})`,
     deny: (why, reason) => `heat-gate no ha lanzado esta build: ${why}. Motivo de la espera: ${reason}. No la relances por tu cuenta: avisa al usuario y espera a que te lo pida.`,
     why: { cancel: "el usuario la canceló desde el panel de heat-gate", timeout: "esperó demasiado con la CPU ocupada o caliente", interrupted: "se interrumpió el turno mientras esperaba", error: "heat-gate falló mientras la retenía" },
     noDecision: "no hubo decisión",
     loadOrHeat: "carga o temperatura",
-    froze: (n, t) => `heat-gate: ${n} procesos de build congelados a ${t}°C para evitar el apagado`,
-    frozeLog: (n, t, thaw) => `builds congeladas a ${t}°C (${n} procesos). Se reanudan solas por debajo de ${thaw}°C.`,
-    resumed: (t) => `heat-gate: builds reanudadas (${t}°C)`,
+    froze: (n, h) => `heat-gate: ${n} procesos de build congelados (${h}) para evitar el apagado`,
+    frozeLog: (n, h, until) => `builds congeladas (${h}, ${n} procesos). Se reanudan solas cuando ${until}.`,
+    resumed: (h) => `heat-gate: builds reanudadas (${h})`,
     memory: "Memoria",
     threads: (load, n) => `carga ${load} · ${n} hilos`,
     swap: (used, total) => `swap ${used}/${total} GB`,
@@ -143,6 +159,29 @@ const BUILD_PATTERN =
 const FREEZE_PATTERN = "GradleDaemon|GradleWorkerMain|Gradle Test Executor|gradle\\.internal\\.worker|plexus\\.classworlds\\.launcher|(^|/)rustc |(^|/)cargo (build|test|bench)";
 
 const SENSE = `
+if [ "$(uname -s)" = Darwin ]; then
+  t=x
+  if command -v macmon >/dev/null 2>&1; then
+    t=$(macmon pipe -s 1 -i 300 2>/dev/null | grep -o '"cpu_temp_avg":[0-9.]*' | head -1 | cut -d: -f2)
+  fi
+  pr=$(notifyutil -g com.apple.system.thermalpressurelevel 2>/dev/null | awk '{print $2}')
+  n=$(sysctl -n hw.logicalcpu)
+  echo "D \${t:-x} \${pr:-x} $(sysctl -n vm.loadavg | awk '{print $2}') $n"
+  echo "U $(ps -A -o %cpu= | awk -v n="$n" '{s += $1} END {printf "%.1f", s / n}')"
+  pg=$(sysctl -n hw.pagesize)
+  avail=$(vm_stat | awk -v pg="$pg" '/^Pages (free|inactive|speculative):/ {gsub(/\\./, "", $NF); s += $NF} END {printf "%.0f", s * pg / 1024}')
+  swap=$(sysctl -n vm.swapusage | awk 'function kb(v) {u = substr(v, length(v)); x = v + 0; return u == "G" ? x * 1048576 : u == "M" ? x * 1024 : x} {printf "%.0f %.0f", kb($3), kb($9)}')
+  echo "M $(( $(sysctl -n hw.memsize) / 1024 )) $avail $swap"
+  for p in $(pgrep -f "$1"); do
+    e=$(ps -o etime= -p "$p" 2>/dev/null | tr -d ' '); [ -z "$e" ] && continue
+    st=$(ps -o stat= -p "$p" 2>/dev/null | tr -d ' ')
+    d=$(lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    args=$(ps -ww -o command= -p "$p" 2>/dev/null)
+    printf 'B\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$p" "$e" "$st" "$d" "$args"
+  done
+  ps -Ao pcpu=,comm= -r | head -5 | awk '{p = $1; $1 = ""; sub(/^ +/, ""); n = split($0, a, "/"); printf "P\\t%s\\t%s\\n", p, a[n]}'
+  exit 0
+fi
 pick=""
 for d in /sys/class/hwmon/hwmon*; do
   case "$(cat "$d/name" 2>/dev/null)" in
@@ -308,8 +347,8 @@ export function register(on, options) {
 
     if (mine.decision === "auto" || mine.decision === "force") {
       await $.store.set("lastStart", await $.clock.now());
-      const t = Math.round(last()?.tctl ?? 0);
-      $.ui.toast(mine.decision === "force" ? L.toastForced(t) : L.toastReleased(t));
+      const h = heatLabel(last());
+      $.ui.toast(mine.decision === "force" ? L.toastForced(h) : L.toastReleased(h));
       return next(e);
     }
     return { deny: L.deny(L.why[mine.decision] ?? L.noDecision, mine.reason ?? L.loadOrHeat) };
@@ -359,7 +398,7 @@ async function sense($) {
     return;
   }
   parsed.sample.at = await $.clock.now();
-  parsed.sample.cpu = cpuPrev !== null && parsed.cpu !== null ? cpuPercent(cpuPrev, parsed.cpu) : null;
+  parsed.sample.cpu = parsed.usage ?? (cpuPrev !== null && parsed.cpu !== null ? cpuPercent(cpuPrev, parsed.cpu) : null);
   cpuPrev = parsed.cpu ?? cpuPrev;
   adopt({ sample: parsed.sample, builds: parsed.builds, hogs: parsed.hogs, cpu: cpuPrev });
   try {
@@ -448,8 +487,26 @@ export function parseDocker(stdout) {
     .sort((a, b) => b.cpu - a.cpu || b.mem - a.mem);
 }
 
+export function pressureOf(raw) {
+  const v = Number(raw);
+  if (raw === undefined || raw === "x" || raw === "" || !Number.isFinite(v)) {
+    return null;
+  }
+  return v >= 10 ? Math.max(0, Math.min(4, Math.round(v / 10) - 1)) : Math.max(0, Math.min(4, Math.round(v)));
+}
+
+export function secondsOf(text) {
+  const t = String(text ?? "").trim();
+  if (/^\d+$/.test(t)) {
+    return Number(t);
+  }
+  const m = t.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  return m ? ((Number(m[1] ?? 0) * 24 + Number(m[2] ?? 0)) * 60 + Number(m[3])) * 60 + Number(m[4]) : 0;
+}
+
 export function parseSense(stdout) {
   let sample = null;
+  let usage = null;
   let cpu = null;
   let mem = null;
   const found = [];
@@ -468,6 +525,22 @@ export function parseSense(stdout) {
         load: Number(l1) || 0,
         ncpu: Number(n) || 1,
       };
+    } else if (line.startsWith("D ")) {
+      const [, t, p, l1, n] = line.split(" ");
+      const temp = Number(t);
+      sample = {
+        tctl: Number.isFinite(temp) && temp > 0 ? temp : null,
+        zone: null,
+        crit: null,
+        boost: null,
+        boostPath: null,
+        load: Number(l1) || 0,
+        ncpu: Number(n) || 1,
+        pressure: pressureOf(p),
+      };
+    } else if (line.startsWith("U ")) {
+      const v = Number(line.slice(2));
+      usage = Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : null;
     } else if (line.startsWith("C ")) {
       const [, busy, idle] = line.split(" ").map(Number);
       cpu = Number.isFinite(busy) && Number.isFinite(idle) ? { busy, idle } : null;
@@ -476,7 +549,7 @@ export function parseSense(stdout) {
       mem = total > 0 ? { used: total - avail, total, swapUsed: (swapTotal || 0) - (swapFree || 0), swapTotal: swapTotal || 0 } : null;
     } else if (line.startsWith("B\t")) {
       const [, pid, etimes, stat, cwd, args] = line.split("\t");
-      found.push({ pid: Number(pid), seconds: Number(etimes) || 0, stopped: /T/.test(stat ?? ""), cwd: cwd ?? "", job: jobOf(args ?? "") });
+      found.push({ pid: Number(pid), seconds: secondsOf(etimes), stopped: /T/.test(stat ?? ""), cwd: cwd ?? "", job: jobOf(args ?? "") });
     } else if (line.startsWith("P\t")) {
       const [, pcpu, comm] = line.split("\t");
       top.push({ pcpu: Number(pcpu) || 0, comm: comm ?? "" });
@@ -485,7 +558,7 @@ export function parseSense(stdout) {
   if (sample !== null) {
     sample.mem = mem;
   }
-  return { sample, builds: found, hogs: top, cpu };
+  return { sample, builds: found, hogs: top, cpu, usage };
 }
 
 const VALUE_FLAGS = new Set(["-x", "--exclude-task", "-p", "--project-dir", "-b", "--build-file", "-c", "--settings-file", "-g", "--gradle-user-home", "-I", "--init-script", "--console", "--warning-mode", "-P", "-pl", "--projects", "-f", "--file", "-s", "--settings", "-T", "--threads", "-rf", "--resume-from"]);
@@ -532,13 +605,59 @@ export function projectOf(cwd) {
   return shortPath(worktree ? worktree[1] : path);
 }
 
+// macOS reports a thermal pressure level instead of a temperature the thresholds can trust.
+export function isPressure(s) {
+  return s?.pressure !== null && s?.pressure !== undefined;
+}
+
+export function tooHot(s, limit) {
+  return isPressure(s) ? s.pressure >= 1 : s?.tctl !== null && s?.tctl !== undefined && s.tctl >= limit;
+}
+
+export function shouldFreeze(s) {
+  return isPressure(s) ? s.pressure >= 2 : s.tctl !== null && s.tctl >= cfg.freeze_at;
+}
+
+export function canThaw(s) {
+  return isPressure(s) ? s.pressure === 0 : s.tctl === null || s.tctl < cfg.thaw_below;
+}
+
+export function heatLabel(s) {
+  if (s?.tctl !== null && s?.tctl !== undefined) {
+    return `${Math.round(s.tctl)}°C`;
+  }
+  return isPressure(s) ? L.pressureShort(L.pressure[s.pressure]) : "–";
+}
+
+export function heatColor(s) {
+  if (isPressure(s)) {
+    return PRESSURE_COLORS[s.pressure];
+  }
+  return s?.tctl !== null && s?.tctl !== undefined ? levelOf(s.tctl).color : COLOR.dim;
+}
+
+export function heatBar(s) {
+  if (isPressure(s)) {
+    return BARS[[1, 3, 5, 7, 7][s.pressure]];
+  }
+  return bar(s.tctl ?? 0);
+}
+
+function hotReason(s) {
+  return isPressure(s) ? L.reasonPressure(L.pressure[s.pressure]) : L.reasonHot(heatLabel(s));
+}
+
+function thawRule() {
+  return isPressure(last()) ? L.pressureNormal : L.coolerThan(cfg.thaw_below);
+}
+
 async function blocker($, now, ticket) {
   const s = last();
   if (frozen !== null) {
     return L.reasonFrozen;
   }
-  if (s && s.tctl >= (ticket === null ? cfg.hold_above : cfg.release_below)) {
-    return L.reasonHot(Math.round(s.tctl));
+  if (s && tooHot(s, ticket === null ? cfg.hold_above : cfg.release_below)) {
+    return hotReason(s);
   }
   const running = builds.filter((b) => !b.stopped);
   if (running.length > 0) {
@@ -601,9 +720,9 @@ async function guardFreeze($) {
     stored = null;
   }
   frozen = stored && Array.isArray(stored.pids) && stored.pids.length > 0 ? stored : null;
-  if (frozen === null && cfg.freeze_enabled && s.tctl >= cfg.freeze_at) {
+  if (frozen === null && cfg.freeze_enabled && shouldFreeze(s)) {
     await freeze($, "auto");
-  } else if (frozen !== null && frozen.reason === "auto" && s.tctl < cfg.thaw_below) {
+  } else if (frozen !== null && frozen.reason === "auto" && canThaw(s)) {
     await thaw($);
   }
 }
@@ -620,10 +739,10 @@ async function freeze($, reason) {
     return;
   }
   await $.process.run(["kill", "-STOP", ...pids], { timeoutMs: 5000 });
-  frozen = { pids, reason, at: await $.clock.now(), temp: Math.round(last()?.tctl ?? 0) };
+  frozen = { pids, reason, at: await $.clock.now(), heat: heatLabel(last()) };
   await $.store.set("frozen", frozen);
-  $.ui.toast(L.froze(pids.length, frozen.temp), { timeoutMs: 10_000 });
-  $.ui.log(L.frozeLog(pids.length, frozen.temp, cfg.thaw_below));
+  $.ui.toast(L.froze(pids.length, frozen.heat), { timeoutMs: 10_000 });
+  $.ui.log(L.frozeLog(pids.length, frozen.heat, thawRule()));
 }
 
 async function thaw($) {
@@ -638,7 +757,7 @@ async function thaw($) {
   }
   frozen = null;
   await $.store.delete("frozen");
-  $.ui.toast(L.resumed(Math.round(last()?.tctl ?? 0)));
+  $.ui.toast(L.resumed(heatLabel(last())));
 }
 
 function last() {
@@ -741,9 +860,9 @@ export function packRows(segments, avail, desktop, gap = NARROW_GAP) {
 export function metricSegments(s, history, docker, tier) {
   const sparkSize = { full: 16, medium: 8, lean: 0 }[tier];
   const segments = [];
-  const temp = [{ key: "temp", color: levelOf(s.tctl).color, bold: true, text: `● ${Math.round(s.tctl)}°C` }];
+  const temp = [{ key: "temp", color: heatColor(s), bold: true, text: `● ${heatLabel(s)}` }];
   if (sparkSize) {
-    temp.push({ key: "temp-gap", text: " " }, ...history.slice(-sparkSize).map((x, i) => ({ key: `sp${i}`, color: levelOf(x.tctl).color, text: bar(x.tctl) })));
+    temp.push({ key: "temp-gap", text: " " }, ...history.slice(-sparkSize).map((x, i) => ({ key: `sp${i}`, color: heatColor(x), text: heatBar(x) })));
   }
   segments.push({ key: "temp", parts: temp });
   if (s.cpu !== null && s.cpu !== undefined) {
@@ -856,7 +975,7 @@ function heldCard(t, state, inBand) {
       Text({ key: "h-title", bold: true, color: COLOR.warm, children: `⏸ ${L.heldTitle} · ${state.label}` }),
       Text({ key: "h-why", children: [Text({ dimColor: true, children: L.waitingFor }), Text({ children: state.reason ?? L.checking })] }),
       Text({ key: "h-cmd", wrap: "truncate-end", children: [Text({ dimColor: true, children: L.command }), Text({ children: state.command })] }),
-      Text({ key: "h-rule", dimColor: true, children: L.heldRule(cfg.release_below, cfg.max_wait_minutes) }),
+      Text({ key: "h-rule", dimColor: true, children: L.heldRule(isPressure(last()) ? L.pressureNormal : L.coolerThan(cfg.release_below), cfg.max_wait_minutes) }),
       Box({
         key: "h-buttons",
         marginTop: inBand ? 0 : 1,
@@ -880,7 +999,8 @@ function pane(t, where, columns, $) {
   if (s === null) {
     return Text({ children: L.reading });
   }
-  const lv = levelOf(s.tctl);
+  const word = isPressure(s) ? (s.tctl !== null ? `  ${L.pressureShort(L.pressure[s.pressure])}` : "") : `  ${levelOf(s.tctl).word}`;
+  const temps = samples.some((x) => x.tctl !== null && x.tctl !== undefined);
   const rows = [];
   rows.push(
     Box({
@@ -888,17 +1008,17 @@ function pane(t, where, columns, $) {
       flexDirection: "row",
       gap: 2,
       children: [
-        Text({ key: "big", bold: true, color: lv.color, children: `● ${Math.round(s.tctl)}°C  ${lv.word}` }),
-        Text({ key: "crit", dimColor: true, children: L.critical(Math.round(s.crit), s.load.toFixed(1), s.ncpu) }),
+        Text({ key: "big", bold: true, color: heatColor(s), children: `● ${heatLabel(s)}${word}` }),
+        Text({ key: "crit", dimColor: true, children: s.crit !== null ? L.critical(Math.round(s.crit), s.load.toFixed(1), s.ncpu) : L.criticalMac(s.load.toFixed(1), s.ncpu) }),
       ],
     }),
   );
   rows.push(stats(t, s));
   if (where === "desktop" && t.Svg) {
-    rows.push(chartSvg(t, s.crit), usageSvg(t));
+    rows.push(temps ? chartSvg(t, s.crit) : null, usageSvg(t));
   } else {
     const width = Math.max(20, Math.min(HISTORY, columns - 8));
-    rows.push(chartText(t, width), usageText(t, width));
+    rows.push(temps ? chartText(t, width) : null, usageText(t, width));
   }
   if (held !== null) {
     rows.push(heldCard(t, held, false));
@@ -970,9 +1090,9 @@ function pane(t, where, columns, $) {
     buttons.push(Button({ key: "copy", label: L.copyTurbo, hotkey: "t", plain: true, onPress: () => $.ui.copy(turboCommand(s.boostPath)) }));
   }
   rows.push(Box({ key: "actions", marginTop: 1, gap: 3, children: buttons }));
-  rows.push(Text({ key: "rules", dimColor: true, children: L.rules(cfg) }));
+  rows.push(Text({ key: "rules", dimColor: true, children: isPressure(s) ? L.rulesMac(cfg) : L.rules(cfg) }));
 
-  return Box({ flexDirection: "column", paddingX: 1, children: rows });
+  return Box({ flexDirection: "column", paddingX: 1, children: rows.filter(Boolean) });
 }
 
 function stats(t, s) {
@@ -1045,9 +1165,9 @@ function chartText(t, width) {
   const lines = [];
   for (let row = height - 1; row >= 0; row -= 1) {
     const cells = data.map((s, i) => {
-      const filled = ((s.tctl - 40) / 70) * height - row;
+      const filled = (((s.tctl ?? 40) - 40) / 70) * height - row;
       const ch = filled >= 1 ? "█" : filled > 0 ? BARS[Math.max(0, Math.min(7, Math.floor(filled * 8)))] : " ";
-      return Text({ key: `c${row}-${i}`, color: levelOf(s.tctl).color, children: ch });
+      return Text({ key: `c${row}-${i}`, color: heatColor(s), children: ch });
     });
     const label = row === height - 1 ? "110° " : row === 0 ? " 40° " : "     ";
     lines.push(Box({ key: `row${row}`, flexDirection: "row", children: [Text({ key: `l${row}`, dimColor: true, children: label }), ...cells] }));
@@ -1059,7 +1179,7 @@ function chartText(t, width) {
 function chartSvg(t, crit) {
   const W = 560;
   const H = 150;
-  const data = samples.slice(-HISTORY);
+  const data = samples.slice(-HISTORY).filter((s) => s.tctl !== null && s.tctl !== undefined);
   const y = (temp) => H - 18 - ((Math.max(40, Math.min(115, temp)) - 40) / 75) * (H - 30);
   const x = (i) => 36 + (i / Math.max(1, HISTORY - 1)) * (W - 44);
   const pts = data.map((s, i) => `${x(i + HISTORY - data.length).toFixed(1)},${y(s.tctl).toFixed(1)}`).join(" ");
@@ -1067,12 +1187,12 @@ function chartSvg(t, crit) {
   const lastX = x(HISTORY - 1).toFixed(1);
   const guide = (temp, color, label) =>
     `<line x1="36" x2="${W - 8}" y1="${y(temp)}" y2="${y(temp)}" stroke="${color}" stroke-dasharray="4 4" stroke-width="1" opacity="0.7"/><text x="4" y="${y(temp) + 4}" font-size="10" fill="${color}" font-family="sans-serif">${label}</text>`;
-  const guides = [guide(crit, COLOR.fire, `${Math.round(crit)}°`), cfg.freeze_enabled ? guide(cfg.freeze_at, COLOR.hot, `${cfg.freeze_at}°`) : "", guide(cfg.hold_above, COLOR.warm, `${cfg.hold_above}°`)].join("");
+  const guides = isPressure(last()) ? "" : [guide(crit, COLOR.fire, `${Math.round(crit)}°`), cfg.freeze_enabled ? guide(cfg.freeze_at, COLOR.hot, `${cfg.freeze_at}°`) : "", guide(cfg.hold_above, COLOR.warm, `${cfg.hold_above}°`)].join("");
   const source = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
 <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="${COLOR.fire}" stop-opacity="0.55"/><stop offset="45%" stop-color="${COLOR.warm}" stop-opacity="0.35"/><stop offset="100%" stop-color="${COLOR.cool}" stop-opacity="0.08"/></linearGradient></defs>
 ${guides}
-${data.length > 1 ? `<polygon points="${first},${H - 18} ${pts} ${lastX},${H - 18}" fill="url(#g)"/><polyline points="${pts}" fill="none" stroke="${levelOf(last().tctl).color}" stroke-width="2.2" stroke-linejoin="round"/>` : ""}
+${data.length > 1 ? `<polygon points="${first},${H - 18} ${pts} ${lastX},${H - 18}" fill="url(#g)"/><polyline points="${pts}" fill="none" stroke="${heatColor(last())}" stroke-width="2.2" stroke-linejoin="round"/>` : ""}
 <text x="${W - 8}" y="${H - 4}" font-size="10" text-anchor="end" fill="${COLOR.dim}" font-family="sans-serif">${L.lastMinutes(Math.round((HISTORY * TICK_MS) / 60000))}</text>
 </svg>`;
-  return t.Svg({ source, alt: L.chartAlt(Math.round(last().tctl)), width: W, height: H });
+  return t.Svg({ source, alt: L.chartAlt(Math.round(last().tctl ?? 0)), width: W, height: H });
 }

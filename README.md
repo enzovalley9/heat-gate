@@ -17,6 +17,7 @@ When several Claude Code sessions run Gradle, Maven, Cargo or Docker builds at t
 
 - **Shared build queue.** A heavy command waits when the CPU is at or above 80°C, when another build is already running or when one has just started. Queued builds start on their own once the CPU drops below 75°C. While a build waits you can press `1` to run it now or `2` to cancel it. After 30 minutes in the queue it is refused.
 - **Emergency freeze.** At 98°C the build processes are paused with `SIGSTOP` and resumed with `SIGCONT` below 82°C, so a runaway build cannot take the machine down.
+- **Linux and macOS.** On a Mac, with Apple Silicon or Intel, the gate follows the thermal pressure that macOS reports (see [macOS](#macos)).
 - **`/heat` pane** with CPU, memory (and swap) and Docker tiles, a temperature chart and a CPU and memory chart (SVG in the desktop app, text in the terminal), each container with its CPU and memory, the builds, the queue, the processes using the most CPU, a manual freeze button and the command to turn turbo boost off.
 - **Light on the machine.** One session reads the sensors every 4 seconds and the containers every 2 minutes, and every other session reuses that reading, so opening more sessions adds no load.
 
@@ -39,9 +40,23 @@ The emergency freeze only touches build processes: Gradle daemons and workers, G
 
 ## Requirements
 
-- Linux. The temperature comes from `/sys/class/hwmon` (`k10temp`, `zenpower` or `coretemp`) and `/sys/class/thermal`. CPU and memory come from `/proc/stat` and `/proc/meminfo`.
+- Linux or macOS.
+  - On Linux the temperature comes from `/sys/class/hwmon` (`k10temp`, `zenpower` or `coretemp`) and `/sys/class/thermal`. CPU and memory come from `/proc/stat` and `/proc/meminfo`.
+  - On macOS nothing needs installing: everything comes from `sysctl`, `vm_stat`, `ps`, `lsof` and `notifyutil`. See [macOS](#macos).
 - Docker is optional: without it the container figures are hidden.
 - Claude Code 2.1.287 or later in the terminal, or 2.1.286 or later in the Code tab of the desktop app.
+
+## macOS
+
+macOS does not hand out the CPU temperature without `sudo`, so on a Mac the gate follows the thermal pressure the system itself reports: `normal`, `moderate`, `high` or `critical`.
+
+- A heavy build waits while the pressure is above `normal` and starts once it is back to `normal`.
+- The emergency freeze pauses the builds when the pressure is `high` and resumes them when it is back to `normal`.
+- The temperature thresholds in [Options](#options) apply on Linux only.
+- With [macmon](https://github.com/vladkens/macmon) installed (`brew install macmon`), the band and the pane also show the CPU temperature in °C. The decisions still follow the pressure, because Apple Silicon runs hot by design.
+- There is no turbo boost to switch off, so that hint and its button do not show.
+
+macOS support is new and has only been tested against recorded command output, not on a real Mac yet. Reports are welcome.
 
 ## Install
 
@@ -59,11 +74,11 @@ Set them in `/plugin`, or pass `--config KEY=VALUE` to `claude plugin install`.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `language` | `en` | `en` or `es` |
-| `hold_above` | `80` | A heavy build waits when the CPU is at or above this temperature (°C) |
-| `release_below` | `75` | A queued build starts below this temperature when no other build runs |
-| `freeze_enabled` | `true` | Pause builds with `SIGSTOP` close to a thermal shutdown |
-| `freeze_at` | `98` | Temperature that triggers the freeze |
-| `thaw_below` | `82` | Frozen builds resume below this temperature |
+| `hold_above` | `80` | Linux: a heavy build waits when the CPU is at or above this temperature (°C) |
+| `release_below` | `75` | Linux: a queued build starts below this temperature when no other build runs |
+| `freeze_enabled` | `true` | Pause builds with `SIGSTOP` close to a thermal shutdown (Linux and macOS) |
+| `freeze_at` | `98` | Linux: temperature that triggers the freeze |
+| `thaw_below` | `82` | Linux: frozen builds resume below this temperature |
 | `max_wait_minutes` | `30` | A queued build is refused after waiting this long |
 | `extra_build_pattern` | empty | Regular expression for more heavy commands, for example `make -j\|ninja` |
 
