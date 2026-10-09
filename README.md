@@ -11,6 +11,10 @@ When several Claude Code sessions run Gradle, Maven, Cargo or Docker builds at t
 ## What it does
 
 - **Band above the prompt** with the CPU temperature and CPU use, each with its own small chart, the memory in use, the running Docker containers, the load, whether turbo boost is on and the builds that are running.
+- **Fits any width.** Like a responsive page, the band picks the richest layout that fits: everything on one line with long charts when there is room, then shorter charts, then no charts, then two lines. A metric is never split across lines.
+
+  ![The same band at 130, 100, 76, 58 and 40 columns](docs/heat-gate-responsive.png)
+
 - **Shared build queue.** A heavy command waits when the CPU is at or above 80°C, when another build is already running or when one has just started. Queued builds start on their own once the CPU drops below 75°C. While a build waits you can press `1` to run it now or `2` to cancel it. After 30 minutes in the queue it is refused.
 - **Emergency freeze.** At 98°C the build processes are paused with `SIGSTOP` and resumed with `SIGCONT` below 82°C, so a runaway build cannot take the machine down.
 - **`/heat` pane** with CPU, memory (and swap) and Docker tiles, a temperature chart and a CPU and memory chart (SVG in the desktop app, text in the terminal), each container with its CPU and memory, the builds, the queue, the processes using the most CPU, a manual freeze button and the command to turn turbo boost off.

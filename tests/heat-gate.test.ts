@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { bytesOf, configure, cpuPercent, isHeavy, labelOf, levelOf, meter, parseDocker, parseSense, tasksOf, turboCommand } from '../hooks/heat-gate.mjs'
+import { bandPlan, bytesOf, cellsOf, configure, cpuPercent, isHeavy, labelOf, levelOf, meter, jobOf, parseDocker, parseSense, projectOf, turboCommand } from '../hooks/heat-gate.mjs'
 
 const sense = (tctl: number, builds = '') =>
   `S ${tctl * 1000} ${tctl * 1000} 105000 1 7.40 16 /sys/devices/system/cpu/cpufreq/boost\n${builds}P\t227\tjava\nP\t96\tnode\n`
@@ -28,14 +28,27 @@ test('labels a build with its tool and tasks', () => {
   expect(labelOf('cd a && ./gradlew clean check integrationTest --continue')).toBe('gradlew clean check integrationTest')
   expect(labelOf('cargo test --all')).toBe('cargo test')
   expect(labelOf('docker compose -f x.yml up -d')).toBe('docker compose up')
-  expect(tasksOf('/usr/lib/jvm/bin/java -cp x org.gradle.wrapper.GradleWrapperMain clean build --continue')).toBe('clean build')
-  expect(tasksOf('/home/u/.cargo/bin/cargo build --release')).toBe('cargo build')
+  expect(jobOf('/usr/lib/jvm/bin/java -cp x org.gradle.wrapper.GradleWrapperMain clean build --continue')).toBe('gradle clean build')
+  expect(jobOf('/home/u/.cargo/bin/cargo build --release')).toBe('cargo build')
+})
+
+test('a running build reads as project › tool and tasks, without JVM noise', () => {
+  const wrapper = 'java -Xmx64m -Dorg.gradle.appname=gradlew -classpath /x/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain'
+  expect(jobOf(`${wrapper} test --tests com.acme.billing.InvoiceServiceTest -x integrationTest`)).toBe('gradle test InvoiceServiceTest')
+  expect(jobOf(`${wrapper} :api:test --tests 'com.acme.*OrderTest.refunds' --tests com.acme.CartTest`)).toBe('gradle api:test *OrderTest +1')
+  expect(jobOf(`${wrapper} --no-daemon -q clean build`)).toBe('gradle clean build')
+  expect(jobOf(`${wrapper}`)).toBe('gradle')
+  expect(jobOf('java -classpath /x/plexus-classworlds.jar org.codehaus.plexus.classworlds.launcher.Launcher -pl api clean verify -Dtest=OrderTest')).toBe('maven clean verify OrderTest')
+  expect(jobOf('/usr/bin/docker buildx build -t app .')).toBe('docker build')
+  expect(projectOf('/home/u/code/payments-api')).toBe('payments-api')
+  expect(projectOf('/home/u/code/payments-api/.claude-worktrees/fix-retry')).toBe('payments-api')
+  expect(projectOf('/home/u/code/payments-api/.claude/worktrees/fix-retry')).toBe('payments-api')
 })
 
 test('reads sensors, builds and processes', () => {
   const r = parseSense(sense(72, 'B\t123\t95\tSl\t/home/u/code/api\tjava org.gradle.wrapper.GradleWrapperMain clean check\n'))
   expect(r.sample).toMatchObject({ tctl: 72, crit: 105, boost: true, load: 7.4, ncpu: 16 })
-  expect(r.builds).toEqual([{ pid: 123, seconds: 95, stopped: false, cwd: '/home/u/code/api', tasks: 'clean check' }])
+  expect(r.builds).toEqual([{ pid: 123, seconds: 95, stopped: false, cwd: '/home/u/code/api', job: 'gradle clean check' }])
   expect(r.hogs[0]).toEqual({ pcpu: 227, comm: 'java' })
   expect(levelOf(72).word).toBe('Warm')
   expect(levelOf(99).word).toBe('Danger')
@@ -163,7 +176,7 @@ test('the band shows CPU, RAM and containers', async ($, on) => {
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
   await clock.advance(9000)
   expect(state.saved.get('docker')).toMatchObject({ list: [{ name: 'postgres' }, { name: 'rabbitmq' }] })
-  const ui = await $.ui.mount(BAND)
+  const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: 140 } })
   expect(await waitFor(clock, ui, /CPU/)).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /50%/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /19\/31G/ })).toBeDefined()
@@ -211,4 +224,40 @@ test('the desktop band and pane render', async ($, on) => {
   const pane = await $.ui.mount({ plugin: 'heat-gate', component: 'Pane', surface: 'desktop', requestId: 'heat-gate', viewport: { columns: 160, rows: 50 }, props: { title: 'heat-gate', isFocused: true, bodyColumns: 120, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } } as any)
   expect(await pane.find({ type: 'Text', text: /postgres/ })).toBeDefined()
   expect(await pane.find({ type: 'Text', text: /Docker containers \(2\)/ })).toBeDefined()
+})
+
+const SAMPLE = { tctl: 61, cpu: 42, mem: { used: 19 * 1024 ** 3, total: 31 * 1024 ** 3 }, load: 2.5, ncpu: 16, boost: true }
+const HISTORY = Array.from({ length: 20 }, (_, i) => ({ tctl: 50 + i, cpu: 30 + i }))
+const DOCKER = [{ name: 'postgres', cpu: 3, mem: 1024 ** 3 }, { name: 'redis', cpu: 1, mem: 512 * 1024 ** 2 }]
+const textOf = (row: any[], gap: string) => row.map((seg) => seg.parts.map((p: any) => p.text).join('')).join(gap)
+
+test('the band picks the richest layout that fits the width, like responsive design', () => {
+  configure({})
+  const tier = (columns: number, desktop: boolean) => bandPlan(SAMPLE, HISTORY, DOCKER, columns, desktop).tier
+  expect([140, 100, 75, 60, 35].map((c) => tier(c, false))).toEqual(['full', 'medium', 'lean', 'stacked', 'compact'])
+  expect([140, 90, 75, 50, 35].map((c) => tier(c, true))).toEqual(['full', 'medium', 'lean', 'stacked', 'compact'])
+  const full = bandPlan(SAMPLE, HISTORY, DOCKER, 140, false)
+  expect(textOf(full.rows[0], full.gap)).toContain('🐳 2 · 1.5 GB')
+  const lean = bandPlan(SAMPLE, HISTORY, DOCKER, 75, false)
+  expect(textOf(lean.rows[0], lean.gap)).not.toMatch(/[▁▂▃▄▅▆▇█▰]/)
+  expect(textOf(lean.rows[0], lean.gap)).toContain('turbo on')
+})
+
+test('no row of the band is wider than the space it gets, and no metric is split', () => {
+  configure({})
+  for (const desktop of [false, true]) {
+    for (let columns = 24; columns <= 180; columns += 2) {
+      const plan = bandPlan(SAMPLE, HISTORY, DOCKER, columns, desktop)
+      for (const row of plan.rows) {
+        if (row.length > 1) expect(cellsOf(textOf(row, plan.gap), desktop)).toBeLessThanOrEqual(plan.avail)
+      }
+      expect(plan.rows.flat().map((seg: any) => seg.key)).toEqual(['temp', 'cpu', 'ram', 'docker', 'load'])
+    }
+  }
+})
+
+test('emoji count as two cells and block glyphs as one', () => {
+  expect(cellsOf('🐳 2', false)).toBe(4)
+  expect(cellsOf('▁▂▃▰▱', true)).toBe(5)
+  expect(cellsOf('load 2.5/16', true)).toBe(10)
 })

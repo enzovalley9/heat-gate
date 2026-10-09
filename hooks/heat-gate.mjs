@@ -322,7 +322,7 @@ export function register(on, options) {
     }
     const t = $.ui.resolve(e);
     const theirs = await next(e);
-    const mine = held !== null ? heldCard(t, held, true) : band(t, props.bodyColumns ?? 100);
+    const mine = held !== null ? heldCard(t, held, true) : band(t, props.bodyColumns ?? 100, e.surface);
     return t.Box({ flexDirection: "column", children: [theirs, mine].filter(Boolean) });
   });
 
@@ -476,7 +476,7 @@ export function parseSense(stdout) {
       mem = total > 0 ? { used: total - avail, total, swapUsed: (swapTotal || 0) - (swapFree || 0), swapTotal: swapTotal || 0 } : null;
     } else if (line.startsWith("B\t")) {
       const [, pid, etimes, stat, cwd, args] = line.split("\t");
-      found.push({ pid: Number(pid), seconds: Number(etimes) || 0, stopped: /T/.test(stat ?? ""), cwd: cwd ?? "", tasks: tasksOf(args ?? "") });
+      found.push({ pid: Number(pid), seconds: Number(etimes) || 0, stopped: /T/.test(stat ?? ""), cwd: cwd ?? "", job: jobOf(args ?? "") });
     } else if (line.startsWith("P\t")) {
       const [, pcpu, comm] = line.split("\t");
       top.push({ pcpu: Number(pcpu) || 0, comm: comm ?? "" });
@@ -488,15 +488,48 @@ export function parseSense(stdout) {
   return { sample, builds: found, hogs: top, cpu };
 }
 
-export function tasksOf(args) {
+const VALUE_FLAGS = new Set(["-x", "--exclude-task", "-p", "--project-dir", "-b", "--build-file", "-c", "--settings-file", "-g", "--gradle-user-home", "-I", "--init-script", "--console", "--warning-mode", "-P", "-pl", "--projects", "-f", "--file", "-s", "--settings", "-T", "--threads", "-rf", "--resume-from"]);
+
+function testClass(pattern) {
+  const clean = String(pattern).replace(/['"]/g, "");
+  const named = clean.split(".").filter((part) => /^[A-Z*]/.test(part));
+  return named.length > 0 ? named.join(".") : clean.split(".").pop();
+}
+
+function tasksIn(rest) {
+  const words = String(rest).trim().split(/\s+/);
+  const tasks = [];
+  const tests = [];
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (w === "--tests") tests.push(testClass(words[++i] ?? ""));
+    else if (w.startsWith("--tests=")) tests.push(testClass(w.slice(8)));
+    else if (w.startsWith("-Dtest=")) tests.push(testClass(w.slice(7)));
+    else if (VALUE_FLAGS.has(w)) i++;
+    else if (w && !w.startsWith("-") && !w.includes("=")) tasks.push(w.replace(/^:/, ""));
+  }
+  const picked = tests.filter(Boolean);
+  const filter = picked.length > 0 ? ` ${picked[0]}${picked.length > 1 ? ` +${picked.length - 1}` : ""}` : "";
+  return `${tasks.slice(0, 3).join(" ")}${filter}`.trim();
+}
+
+export function jobOf(args) {
   const text = String(args).trim();
-  const jvm = text.match(/(?:GradleWrapperMain|GradleMain|classworlds\.launcher\.Launcher)\s+(.*)$/);
-  const rest = jvm ? jvm[1] : text.split(/\s+/).map((w, i) => (i === 0 ? w.split("/").pop() : w)).join(" ");
-  return rest
-    .split(/\s+/)
-    .filter((w) => w && !w.startsWith("-") && !w.includes("="))
-    .slice(0, 4)
-    .join(" ");
+  const jvm = text.match(/(GradleWrapperMain|GradleMain|classworlds\.launcher\.Launcher)(?:\s+(.*))?$/);
+  if (jvm) {
+    return `${jvm[1].endsWith("Launcher") ? "maven" : "gradle"} ${tasksIn(jvm[2] ?? "")}`.trim();
+  }
+  const other = text.match(/(?:^|\/)(cargo|go|bazel)(?:-real)?\s+(\w+)/) ?? text.match(/(?:^|\/)(docker)\s+(?:buildx\s+)?(build)\b/);
+  if (other) {
+    return `${other[1]} ${other[2]}`;
+  }
+  return tasksIn(text.split(/\s+/).map((w, i) => (i === 0 ? w.split("/").pop() : w)).join(" "));
+}
+
+export function projectOf(cwd) {
+  const path = String(cwd);
+  const worktree = path.match(/^(.*?)\/\.claude(?:-worktrees|\/worktrees)\//);
+  return shortPath(worktree ? worktree[1] : path);
 }
 
 async function blocker($, now, ticket) {
@@ -622,10 +655,6 @@ export function bar(temp) {
   return BARS[Math.min(BARS.length - 1, Math.floor(ratio * BARS.length))];
 }
 
-function spark(t, count) {
-  return samples.slice(-count).map((s, i) => t.Text({ key: `sp${i}`, color: levelOf(s.tctl).color, children: bar(s.tctl) }));
-}
-
 export function usageColor(percent) {
   return percent >= 85 ? COLOR.fire : percent >= 70 ? COLOR.hot : percent >= 50 ? COLOR.warm : COLOR.ok;
 }
@@ -680,47 +709,134 @@ function ago(seconds) {
   return m < 60 ? `${m}m${String(seconds % 60).padStart(2, "0")}s` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
 }
 
-function band(t, columns) {
-  const { Box, Text } = t;
-  const s = last();
-  const lv = levelOf(s.tctl);
-  const wide = columns >= 110;
-  const width = wide ? 16 : 8;
-  const sep = (k) => Text({ key: k, dimColor: true, children: "  │  " });
-  const metrics = [Text({ key: "temp", color: lv.color, bold: true, children: `● ${Math.round(s.tctl)}°C ` }), ...spark(t, width)];
+const WIDE_CHARS = /\p{Extended_Pictographic}/u;
+const BLOCK_CHARS = /[▀-◿]/;
+
+export function cellsOf(text, desktop) {
+  let narrow = 0;
+  let fixed = 0;
+  for (const ch of String(text)) {
+    if (WIDE_CHARS.test(ch)) fixed += 2;
+    else if (BLOCK_CHARS.test(ch)) fixed += 1;
+    else narrow += 1;
+  }
+  return Math.ceil(fixed + narrow * (desktop ? 0.88 : 1));
+}
+
+const WIDE_GAP = "  │  ";
+const NARROW_GAP = " │ ";
+const widthOf = (segment, desktop) => cellsOf(segment.parts.map((p) => p.text).join(""), desktop);
+const rowWidth = (row, desktop, gap) => row.reduce((n, seg) => n + widthOf(seg, desktop), 0) + (row.length - 1) * cellsOf(gap, desktop);
+
+export function packRows(segments, avail, desktop, gap = NARROW_GAP) {
+  const rows = [];
+  for (const seg of segments) {
+    const row = rows[rows.length - 1];
+    if (row && rowWidth([...row, seg], desktop, gap) <= avail) row.push(seg);
+    else rows.push([seg]);
+  }
+  return rows;
+}
+
+export function metricSegments(s, history, docker, tier) {
+  const sparkSize = { full: 16, medium: 8, lean: 0 }[tier];
+  const segments = [];
+  const temp = [{ key: "temp", color: levelOf(s.tctl).color, bold: true, text: `● ${Math.round(s.tctl)}°C` }];
+  if (sparkSize) {
+    temp.push({ key: "temp-gap", text: " " }, ...history.slice(-sparkSize).map((x, i) => ({ key: `sp${i}`, color: levelOf(x.tctl).color, text: bar(x.tctl) })));
+  }
+  segments.push({ key: "temp", parts: temp });
   if (s.cpu !== null && s.cpu !== undefined) {
-    metrics.push(sep("s1"), Text({ key: "cpu-l", dimColor: true, children: "CPU " }), Text({ key: "cpu", color: usageColor(s.cpu), bold: true, children: `${String(Math.round(s.cpu)).padStart(2)}% ` }), ...usageSpark(t, "cs", width, (x) => x.cpu ?? null));
+    const cpu = [
+      { key: "cpu-l", dimColor: true, text: "CPU " },
+      { key: "cpu", color: usageColor(s.cpu), bold: true, text: `${Math.round(s.cpu)}%` },
+    ];
+    if (sparkSize) {
+      const seen = history.slice(-sparkSize).filter((x) => x.cpu !== null && x.cpu !== undefined);
+      if (seen.length > 0) cpu.push({ key: "cpu-gap", text: " " }, ...seen.map((x, i) => ({ key: `cs${i}`, color: usageColor(x.cpu), text: pctBar(x.cpu) })));
+    }
+    segments.push({ key: "cpu", parts: cpu });
   }
   const mp = memPercent(s.mem);
   if (mp !== null) {
-    metrics.push(sep("s2"), Text({ key: "ram-l", dimColor: true, children: "RAM " }), Text({ key: "ram", color: usageColor(mp), bold: true, children: `${gb(s.mem.used)}/${gb(s.mem.total)}G ` }), Text({ key: "ram-m", color: usageColor(mp), children: meter(mp, wide ? 8 : 5) }));
+    const ram = [
+      { key: "ram-l", dimColor: true, text: "RAM " },
+      { key: "ram", color: usageColor(mp), bold: true, text: `${gb(s.mem.used)}/${gb(s.mem.total)}G` },
+    ];
+    if (tier !== "lean") ram.push({ key: "ram-m", color: usageColor(mp), text: ` ${meter(mp, tier === "full" ? 8 : 5)}` });
+    segments.push({ key: "ram", parts: ram });
   }
-  if (containers !== null) {
-    const total = containers.reduce((sum, c) => sum + c.mem, 0);
-    metrics.push(sep("s3"), Text({ key: "dk", color: containers.length > 0 ? COLOR.cool : COLOR.dim, children: `🐳 ${containers.length}${containers.length > 0 && wide ? ` · ${human(total)}` : ""}` }));
+  if (docker !== null && docker !== undefined) {
+    const total = docker.reduce((sum, c) => sum + c.mem, 0);
+    const extra = tier === "full" && docker.length > 0 ? ` · ${human(total)}` : "";
+    segments.push({ key: "docker", parts: [{ key: "dk", color: docker.length > 0 ? COLOR.cool : COLOR.dim, text: `🐳 ${docker.length}${extra}` }] });
   }
-  metrics.push(sep("s4"), Text({ key: "load", dimColor: true, children: `${L.load} ${s.load.toFixed(1)}/${s.ncpu}` }));
-  if (s.boost !== null) {
-    metrics.push(Text({ key: "boost", color: s.boost ? COLOR.warm : COLOR.dim, children: ` · ${s.boost ? L.turboOn : L.turboOff}` }));
+  const load = [{ key: "load", dimColor: true, text: `${L.load} ${s.load.toFixed(1)}/${s.ncpu}` }];
+  if (s.boost !== null && s.boost !== undefined && (tier !== "lean" || s.boost)) {
+    load.push({ key: "boost", color: s.boost ? COLOR.warm : COLOR.dim, text: ` · ${s.boost ? L.turboOn : L.turboOff}` });
   }
+  segments.push({ key: "load", parts: load });
+  return segments;
+}
 
-  const activity = [];
+export function bandPlan(s, history, docker, columns, desktop) {
+  const avail = Math.max(10, columns - 4);
+  for (const tier of ["full", "medium", "lean"]) {
+    const segments = metricSegments(s, history, docker, tier);
+    const gap = tier === "full" ? WIDE_GAP : NARROW_GAP;
+    if (rowWidth(segments, desktop, gap) <= avail) return { tier, avail, gap, rows: [segments] };
+  }
+  const medium = packRows(metricSegments(s, history, docker, "medium"), avail, desktop);
+  if (medium.length <= 2) return { tier: "stacked", avail, gap: NARROW_GAP, rows: medium };
+  return { tier: "compact", avail, gap: NARROW_GAP, rows: packRows(metricSegments(s, history, docker, "lean"), avail, desktop) };
+}
+
+function clipCells(text, max, desktop) {
+  if (cellsOf(text, desktop) <= max) return text;
+  const chars = [...text];
+  while (chars.length > 1 && cellsOf(chars.join("") + "…", desktop) > max) chars.pop();
+  return chars.join("") + "…";
+}
+
+function activitySegments(avail, desktop) {
+  const segments = [];
   const running = builds.filter((b) => !b.stopped);
   if (running.length > 0) {
     const first = running[0];
-    activity.push(Text({ key: "builds", color: COLOR.accent, children: `⚙ ${L.builds(running.length)}${shortPath(first.cwd)} ${first.tasks} ${ago(first.seconds)}  ` }));
+    const time = ` · ${ago(first.seconds)}`;
+    const arrow = first.job ? " › " : "";
+    const head = clipCells(`⚙ ${L.builds(running.length)}${projectOf(first.cwd)}`, avail - cellsOf(time, desktop), desktop);
+    const job = clipCells(first.job, avail - cellsOf(head + arrow + time, desktop), desktop);
+    const parts = [{ key: "builds", color: COLOR.accent, bold: true, text: head }];
+    if (arrow && cellsOf(job, desktop) > 1) parts.push({ key: "builds-a", dimColor: true, text: arrow }, { key: "builds-j", color: COLOR.accent, text: job });
+    parts.push({ key: "builds-t", dimColor: true, text: time });
+    segments.push({ key: "builds", parts });
   }
   if (queue.length > 0) {
-    activity.push(Text({ key: "queue", color: COLOR.warm, children: `⏸ ${L.queued(queue.length)}  ` }));
+    segments.push({ key: "queue", parts: [{ key: "queue", color: COLOR.warm, text: `⏸ ${L.queued(queue.length)}` }] });
   }
   if (frozen !== null) {
-    activity.push(Text({ key: "frozen", color: COLOR.cool, bold: true, children: `❄ ${L.frozenBadge}` }));
+    segments.push({ key: "frozen", parts: [{ key: "frozen", color: COLOR.cool, bold: true, text: `❄ ${L.frozenBadge}` }] });
   }
-  const rows = [Box({ key: "metrics", flexDirection: "row", children: metrics })];
-  if (activity.length > 0) {
-    rows.push(Box({ key: "activity", flexDirection: "row", children: activity }));
-  }
-  return Box({ key: "heat-band", flexDirection: "column", paddingX: 1, children: rows });
+  return segments;
+}
+
+function drawRow(t, row, key, gap) {
+  const { Box, Text } = t;
+  const children = [];
+  row.forEach((seg, i) => {
+    if (i > 0) children.push(Text({ key: `sep-${seg.key}`, dimColor: true, children: gap }));
+    children.push(Box({ key: seg.key, flexDirection: "row", flexShrink: 0, children: seg.parts.map(({ key: k, text, ...style }) => Text({ key: k, ...style, children: text })) }));
+  });
+  return Box({ key, flexDirection: "row", children });
+}
+
+function band(t, columns, surface) {
+  const desktop = surface === "desktop";
+  const plan = bandPlan(last(), samples, containers, columns, desktop);
+  const rows = plan.rows.map((row, i) => drawRow(t, row, `metrics-${i}`, plan.gap));
+  packRows(activitySegments(plan.avail, desktop), plan.avail, desktop, WIDE_GAP).forEach((row, i) => rows.push(drawRow(t, row, `activity-${i}`, WIDE_GAP)));
+  return t.Box({ key: "heat-band", flexDirection: "column", paddingX: 1, children: rows });
 }
 
 function heldCard(t, state, inBand) {
@@ -799,8 +915,9 @@ function pane(t, where, columns, $) {
         wrap: "truncate-end",
         children: [
           Text({ color: b.stopped ? COLOR.cool : COLOR.accent, children: b.stopped ? "  ❄ " : "  ⚙ " }),
-          Text({ bold: true, children: shortPath(b.cwd) }),
-          Text({ children: `  ${b.tasks}` }),
+          Text({ bold: true, children: projectOf(b.cwd) }),
+          Text({ dimColor: true, children: b.job ? " › " : "" }),
+          Text({ children: b.job }),
           Text({ dimColor: true, children: `  ${ago(b.seconds)}${b.stopped ? L.frozenSuffix : ""}` }),
         ],
       }),
