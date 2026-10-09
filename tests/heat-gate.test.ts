@@ -9,6 +9,8 @@ test('spots heavy builds and lets everything else through', () => {
   for (const c of [
     './gradlew clean check integrationTest --continue',
     'cd app && ./gradlew --no-daemon -q compileJava',
+    './gradlew codenarcMain',
+    './gradlew e2eTest',
     'mvn -q verify',
     'cargo build --release',
     'go test ./...',

@@ -3,7 +3,6 @@ const TICK_MS = 4000;
 const HISTORY = 90;
 const SPARK = 24;
 const GRACE_MS = 45_000;
-const STALE_TICKET_MS = 2 * 60 * 60 * 1000;
 const POLL_SECONDS = "3";
 const DOCKER_MS = 2 * 60 * 1000;
 const DOCKER_CLAIM_MS = 30_000;
@@ -150,7 +149,7 @@ const LEVEL_LIMITS = [60, 80, 90, 98, Infinity];
 const LEVEL_COLORS = [COLOR.cool, COLOR.ok, COLOR.warm, COLOR.hot, COLOR.fire];
 
 export const HEAVY =
-  /(?:^|[\s;&|(])(?:\.\/)?(?:gradlew|gradle|mvnw|mvn)\b(?=[^;&|]*\b(?:build|test|check|integrationTest|assemble|install|verify|package|bootRun|run|compile\w*|jacoco\w*)\b)|\bcargo\s+(?:build|test|bench|run)\b|\bgo\s+(?:build|test)\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:build|test|e2e)\b|\bdocker(?:\s+buildx)?\s+build\b|\bdocker(?:-|\s+)compose\b[^;&|]*\bup\b|\bbazel\s+(?:build|test)\b/;
+  /(?:^|[\s;&|(])(?:\.\/)?(?:gradlew|gradle|mvnw|mvn)\b(?=[^;&|]*\b(?:build|test|check|integrationTest|assemble|install|verify|package|bootRun|run|compile\w*|jacoco\w*|codenarc\w*|e2e\w*)\b)|\bcargo\s+(?:build|test|bench|run)\b|\bgo\s+(?:build|test)\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:build|test|e2e)\b|\bdocker(?:\s+buildx)?\s+build\b|\bdocker(?:-|\s+)compose\b[^;&|]*\bup\b|\bbazel\s+(?:build|test)\b/;
 
 // Every alternative starts with a word and a parenthesis or an escaped dot, so the
 // shell that receives the pattern as an argument never matches it with pgrep -f.
@@ -689,7 +688,7 @@ async function liveTickets($, now) {
   } catch {
     stored = [];
   }
-  const live = (Array.isArray(stored) ? stored : []).filter((x) => now - x.since < STALE_TICKET_MS);
+  const live = (Array.isArray(stored) ? stored : []).filter((x) => now - x.since < (cfg.max_wait_minutes + 10) * 60_000);
   return live.sort((a, b) => a.since - b.since);
 }
 
