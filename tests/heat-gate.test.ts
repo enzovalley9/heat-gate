@@ -149,7 +149,7 @@ test('reads a Mac: thermal pressure, degrees when macmon is there, BSD elapsed t
 })
 
 test('on a Mac the thermal pressure decides, not the degrees', () => {
-  configure({ language: 'es' })
+  configure({})
   const mac = (pressure: number, tctl: number | null = null) => ({ tctl, pressure, crit: null })
   expect(tooHot(mac(0, 95), 80)).toBe(false)
   expect(tooHot(mac(1), 80)).toBe(true)
@@ -157,8 +157,11 @@ test('on a Mac the thermal pressure decides, not the degrees', () => {
   expect(shouldFreeze(mac(2))).toBe(true)
   expect(canThaw(mac(1))).toBe(false)
   expect(canThaw(mac(0))).toBe(true)
-  expect(heatLabel(mac(2))).toBe('presión alta')
+  expect(heatLabel(mac(2))).toBe('pressure high')
   expect(heatLabel(mac(0, 64.4))).toBe('64°C')
+  configure({ language: 'es' })
+  expect(heatLabel(mac(2))).toBe('presión alta')
+  configure({})
   expect(tooHot({ tctl: 85, crit: 105 }, 80)).toBe(true)
   configure({})
 })
@@ -285,7 +288,7 @@ test('on a Mac a moderate pressure holds the build until it is back to normal', 
   expect(await pending).toEqual({ result: 'ok' })
 })
 
-test('on a Mac the band and the pane show the pressure, never a made-up temperature', { options: { language: 'es' } }, async ($, on) => {
+test('on a Mac the band and the pane show the pressure, never a made-up temperature', async ($, on) => {
   const state = { tctl: 0, builds: '', saved: new Map(), ran: [] as string[], pressure: 2 }
   const clock = stubs(on, state)
   startStubs(on)
@@ -293,11 +296,11 @@ test('on a Mac the band and the pane show the pressure, never a made-up temperat
     await $.session.start({ surface, isInteractive: true, cwd: '/work' } as any)
     await clock.advance(9000)
     const band = await $.ui.mount({ ...BAND, surface })
-    expect(await band.find({ type: 'Text', text: /presión alta/ })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: /pressure high/ })).toBeDefined()
     expect(await band.find({ type: 'Text', text: /°C/ })).toBeUndefined()
     const pane = await $.ui.mount({ plugin: 'heat-gate', component: 'Pane', surface, requestId: 'heat-gate', viewport: { columns: 160, rows: 50 }, props: { title: 'heat-gate', isFocused: true, bodyColumns: 120, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } } as any)
-    expect(await pane.find({ type: 'Text', text: /presión térmica de macOS · carga 3.2\/10/ })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /mientras la presión térmica de macOS no sea normal/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /macOS thermal pressure · load 3.2\/10/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /while the macOS thermal pressure is above normal/ })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /°C/ })).toBeUndefined()
   }
 })
