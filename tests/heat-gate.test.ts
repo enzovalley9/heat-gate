@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { BUILD_PATTERN, FREEZE_PATTERN, bandPlan, bytesOf, canThaw, cellsOf, configure, cpuPercent, heatLabel, isContinuous, isHeavy, labelOf, levelOf, meter, jobOf, parseDocker, parseSense, pressureOf, projectOf, secondsOf, shouldFreeze, tooHot, turboCommand } from '../hooks/heat-gate.mjs'
+import { BUILD_PATTERN, FREEZE_PATTERN, bandPlan, procProgram, bytesOf, canThaw, cellsOf, configure, cpuPercent, heatLabel, isContinuous, isHeavy, labelOf, levelOf, meter, jobOf, parseDocker, parseSense, pressureOf, projectOf, secondsOf, shouldFreeze, tooHot, turboCommand } from '../hooks/heat-gate.mjs'
 
 const sense = (tctl: number, builds = '') =>
   `S ${tctl * 1000} ${tctl * 1000} 105000 1 7.40 16 /sys/devices/system/cpu/cpufreq/boost\n${builds}P\t227\tjava\nP\t96\tnode\n`
@@ -118,6 +118,7 @@ test('spots make, ninja, cmake, Xcode, Swift, TypeScript, Next, Vite and compose
     'docker compose -f compose.ci.yml build api',
     'docker-compose build',
     'cd web && npm run build',
+    'go run ./cmd/api',
   ]) expect(isHeavy(c), c).toBe(true)
   for (const c of [
     'make clean',
@@ -141,7 +142,12 @@ test('spots make, ninja, cmake, Xcode, Swift, TypeScript, Next, Vite and compose
     'swift --version',
     'tsc --version',
     'npx tsc --init',
+    'next dev',
     'next lint',
+    'vite',
+    'vite preview',
+    'npm run dev',
+    'pnpm start',
     'docker compose logs build',
     'docker compose -f build.yml ps',
     'mkdir -p cmake-build',
@@ -174,6 +180,7 @@ test('the new build processes match their executable, never a shell or a lookali
     'docker compose build',
     'docker compose -f ci.yml build api',
     '/usr/libexec/docker/cli-plugins/docker-compose compose build',
+    '/usr/local/go/bin/go run ./cmd/api',
   ]) expect(build.test(line), line).toBe(true)
   for (const line of [
     '/usr/bin/cmake -S . -B build',
@@ -190,6 +197,37 @@ test('the new build processes match their executable, never a shell or a lookali
     'docker run img build',
     'tail -f /tmp/tsc.log',
   ]) expect(build.test(line), line).toBe(false)
+})
+
+test('a JavaScript dev server, go run or a watch is not a running build', () => {
+  for (const args of [
+    'npm run dev',
+    'npm start',
+    'npm run dev:web',
+    'node /usr/lib/node_modules/pnpm/bin/pnpm.cjs run dev',
+    'node /p/.yarn/releases/yarn-4.1.0.cjs serve',
+    'bun run dev',
+    'pnpm start',
+    'node /p/node_modules/.bin/next dev',
+    'node /p/node_modules/.bin/vite',
+    'node /p/node_modules/.bin/vite --port 5173',
+    '/usr/local/go/bin/go run ./cmd/api',
+    'node /p/node_modules/.bin/tsc -w',
+  ]) expect(isContinuous(args), args).toBe(true)
+  for (const args of [
+    'npm run build',
+    'npm test',
+    'npm run devtools-build',
+    'node /p/node_modules/.bin/vite build',
+    'node /p/node_modules/.bin/next build',
+    '/usr/local/go/bin/go build ./...',
+    'node /p/node_modules/.bin/tsc -p .',
+    '/usr/bin/make -j8',
+  ]) expect(isContinuous(args), args).toBe(false)
+  expect(procProgram('/usr/local/bin/node --inspect /p/node_modules/.bin/vite build')).toEqual({ tool: 'vite', args: ['build'] })
+  expect(procProgram('/usr/bin/swift-build -c release')).toEqual({ tool: 'swift', args: ['build', '-c', 'release'] })
+  const out = parseSense(sense(60, 'B\t1\t900\tSl\t/p/web\tnpm run dev\nB\t2\t900\tSl\t/p/web\tnode /p/web/node_modules/.bin/vite\nB\t3\t30\tSl\t/p/app\tnode /p/app/node_modules/.bin/next build\nB\t4\t60\tSl\t/p/go\t/usr/local/go/bin/go run .\n'))
+  expect(out.builds.map((b: any) => [b.pid, b.job])).toEqual([[3, 'next build']])
 })
 
 test('labels a build with its tool and tasks', () => {
@@ -619,6 +657,13 @@ test('a second freeze keeps the pids of the first, and resuming never drops a ne
   await pane.press({ key: 'thaw' })
   expect(state.calls).toContainEqual(['kill', '-CONT', '7', '4242'])
   expect(state.saved.get('frozen')).toEqual(newer)
+})
+
+test('a running dev server does not hold an npm build', async ($, on) => {
+  configure({})
+  const state = { tctl: 62, builds: 'B\t9\t900\tSl\t/p/web\tnpm run dev\nB\t10\t900\tSl\t/p/web\tnode /p/web/node_modules/.bin/vite\n', saved: new Map(), ran: [] as string[] }
+  stubs(on, state)
+  expect(await $.tool.call({ tool: 'Bash', command: 'npm run build' })).toEqual({ result: 'ok' })
 })
 
 function startStubs(on: any) {

@@ -154,7 +154,7 @@ const JAVA_MAIN = "^([^ ]*/)?java( .*)? ";
 const EXE = "^([^ ]*/)?";
 // A Node or Bun script shows up as the interpreter followed by the path of the script.
 const JS_SCRIPT = "^([^ ]*/)?(node|nodejs|bun)( -[^ ]+)* [^ ]*/";
-const SCRIPT = "(build|test|e2e)([:.-][^ ]*)?( |$)";
+const SCRIPT = "(build|test|e2e|dev|start|serve)([:.-][^ ]*)?( |$)";
 
 // Every alternative is anchored to the executable at the start of the command line, so
 // the shell that receives the pattern as an argument never matches itself with pgrep -f.
@@ -164,7 +164,7 @@ export const BUILD_PATTERN = [
   `${JAVA_MAIN}org\\.gradle\\.launcher\\.GradleMain( |$)`,
   `${JAVA_MAIN}org\\.codehaus\\.plexus\\.classworlds\\.launcher\\.Launcher( |$)`,
   `${EXE}cargo( \\+[^ ]+)? (build|test|bench|run)( |$)`,
-  `${EXE}go (build|test)( |$)`,
+  `${EXE}go (build|test|run)( |$)`,
   `${EXE}docker(-buildx)? (buildx )?build( |$)`,
   `${EXE}(docker compose|docker-compose( compose)?)( -[^ ]+( [^ -][^ ]*)?)* build( |$)`,
   `${EXE}bazel(-real)? (build|test)( |$)`,
@@ -175,8 +175,8 @@ export const BUILD_PATTERN = [
   `${EXE}swift(-build|-test| build| test)( |$)`,
   `${EXE}tsc( |$)`,
   `${JS_SCRIPT}tsc( |$)`,
-  `${JS_SCRIPT}next build( |$)`,
-  `${JS_SCRIPT}vite build( |$)`,
+  `${JS_SCRIPT}next (build|dev)( |$)`,
+  `${JS_SCRIPT}vite( |$)`,
   `${EXE}(npm|pnpm|yarn|bun)( run| run-script)? ${SCRIPT}`,
   `${JS_SCRIPT}(npm-cli\\.js|npm|pnpm(\\.c?js)?|yarn(-[^ /]*)?(\\.c?js)?)( run| run-script)? ${SCRIPT}`,
 ].join("|");
@@ -714,11 +714,22 @@ export function procProgram(args) {
   return { tool, args: rest };
 }
 
+const DEV_SCRIPT = /^(?:dev|start|serve)(?:[:.-]|$)/;
+
 export function isContinuous(args) {
   const text = String(args).trim();
   if (/(?:^|\/)cargo(?:\s+\+\S+)?\s+run(?:\s|$)/.test(text)) {
     return true;
   }
+  const p = procProgram(text);
+  const subs = p.args.filter((w) => !w.startsWith("-"));
+  if (["npm", "pnpm", "yarn", "bun"].includes(p.tool)) {
+    const script = subs[0] === "run" || subs[0] === "run-script" ? subs[1] : subs[0];
+    if (DEV_SCRIPT.test(script ?? "")) return true;
+  }
+  if ((p.tool === "next" || p.tool === "vite") && !subs.includes("build")) return true;
+  if (p.tool === "go" && subs[0] === "run") return true;
+  if (p.tool === "tsc" && p.args.some((w) => w === "-w" || w === "--watch")) return true;
   const jvm = text.match(/(GradleWrapperMain|GradleMain|classworlds\.launcher\.Launcher)(?:\s+(.*))?$/);
   if (!jvm) {
     return false;
@@ -1136,7 +1147,7 @@ function jobIn(words) {
     return k < rest.length ? jobIn(rest.slice(k)) : null;
   }
   if (tool === "cargo" && ["build", "test", "bench", "run"].includes(first)) return `cargo ${first}`;
-  if (tool === "go" && ["build", "test"].includes(first)) return `go ${first}`;
+  if (tool === "go" && ["build", "test", "run"].includes(first)) return `go ${first}`;
   if (JS_PACKAGERS.includes(tool)) {
     if (tool !== "npm" && JS_TOOLS.has(first)) return jobIn(args.slice(args.indexOf(first)));
     const script = first === "run" || first === "run-script" ? second : first;
