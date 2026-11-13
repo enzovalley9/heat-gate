@@ -88,6 +88,110 @@ test('the process patterns match the executable, never a shell that mentions it'
   }
 })
 
+test('spots make, ninja, cmake, Xcode, Swift, TypeScript, Next, Vite and compose builds', () => {
+  configure({})
+  for (const c of [
+    'make',
+    'make -j8',
+    'make -j 8 -C build all',
+    'gmake install',
+    'make clean all',
+    'ninja',
+    'ninja -C out/Release',
+    'cmake --build build -j 8',
+    'cmake --build build --target api',
+    'xcodebuild -scheme App -destination "platform=iOS Simulator,name=iPhone 16" test',
+    'xcodebuild -workspace App.xcworkspace -scheme App build',
+    'xcodebuild -project App.xcodeproj',
+    'swift build -c release',
+    'swift test --filter OrderTests',
+    'tsc',
+    'tsc --noEmit -p tsconfig.json',
+    'npx tsc -b',
+    'pnpm exec tsc --noEmit',
+    'yarn tsc',
+    'next build',
+    'npx next build',
+    'vite build',
+    'pnpm vite build',
+    'docker compose build',
+    'docker compose -f compose.ci.yml build api',
+    'docker-compose build',
+    'cd web && npm run build',
+  ]) expect(isHeavy(c), c).toBe(true)
+  for (const c of [
+    'make clean',
+    'make help',
+    'make --version',
+    'make -n all',
+    'which make',
+    'man make',
+    'automake --add-missing',
+    'makeinfo doc.texi',
+    'git commit -m "make the build faster"',
+    'echo make tsc ninja',
+    'cmake -S . -B build',
+    'cmake-format -i CMakeLists.txt',
+    'ninja -t clean',
+    'ninja --version',
+    'xcodebuild -list',
+    'xcodebuild -showsdks',
+    'xcodebuild clean',
+    'swift package resolve',
+    'swift --version',
+    'tsc --version',
+    'npx tsc --init',
+    'next lint',
+    'docker compose logs build',
+    'docker compose -f build.yml ps',
+    'mkdir -p cmake-build',
+    'grep -rn "tsc" src',
+  ]) expect(isHeavy(c), c).toBe(false)
+  expect(labelOf('make -j8 -C build all')).toBe('make all')
+  expect(labelOf('xcodebuild -scheme App test')).toBe('xcodebuild test')
+  expect(labelOf('npx next build')).toBe('next build')
+  expect(labelOf('docker compose -f compose.ci.yml build api')).toBe('docker compose build')
+})
+
+test('the new build processes match their executable, never a shell or a lookalike', () => {
+  const build = new RegExp(BUILD_PATTERN)
+  for (const line of [
+    '/usr/bin/make -j8',
+    'gmake -C sub',
+    'ninja -C out',
+    '/usr/local/bin/cmake --build build -j 8',
+    '/usr/bin/xcodebuild -scheme App test',
+    '/usr/bin/swift-build -c release',
+    'swift test',
+    'node /p/node_modules/.bin/tsc -p .',
+    '/usr/local/bin/node --max-old-space-size=4096 /p/node_modules/.bin/next build',
+    'node /p/node_modules/.bin/vite build',
+    'npm run build',
+    'npm test',
+    'node /usr/lib/node_modules/pnpm/bin/pnpm.cjs run build:web',
+    'node /p/.yarn/releases/yarn-4.1.0.cjs build',
+    'bun run build',
+    'docker compose build',
+    'docker compose -f ci.yml build api',
+    '/usr/libexec/docker/cli-plugins/docker-compose compose build',
+  ]) expect(build.test(line), line).toBe(true)
+  for (const line of [
+    '/usr/bin/cmake -S . -B build',
+    '/bin/zsh -c make -j8',
+    'bash -c npm run build',
+    'vim Makefile',
+    '/usr/bin/automake',
+    'makeinfo doc.texi',
+    'cmake-format -i CMakeLists.txt',
+    'npm install',
+    'npm run lint',
+    'node /p/server.js',
+    'docker compose up',
+    'docker run img build',
+    'tail -f /tmp/tsc.log',
+  ]) expect(build.test(line), line).toBe(false)
+})
+
 test('labels a build with its tool and tasks', () => {
   expect(labelOf('cd a && ./gradlew clean check integrationTest --continue')).toBe('gradlew clean check integrationTest')
   expect(labelOf('cargo test --all')).toBe('cargo test')

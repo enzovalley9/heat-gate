@@ -151,17 +151,34 @@ const LEVEL_LIMITS = [60, 80, 90, 98, Infinity];
 const LEVEL_COLORS = [COLOR.cool, COLOR.ok, COLOR.warm, COLOR.hot, COLOR.fire];
 
 const JAVA_MAIN = "^([^ ]*/)?java( .*)? ";
+const EXE = "^([^ ]*/)?";
+// A Node or Bun script shows up as the interpreter followed by the path of the script.
+const JS_SCRIPT = "^([^ ]*/)?(node|nodejs|bun)( -[^ ]+)* [^ ]*/";
+const SCRIPT = "(build|test|e2e)([:.-][^ ]*)?( |$)";
 
 // Every alternative is anchored to the executable at the start of the command line, so
 // the shell that receives the pattern as an argument never matches itself with pgrep -f.
+// The patterns are plain POSIX extended regular expressions, which JavaScript reads too.
 export const BUILD_PATTERN = [
   `${JAVA_MAIN}org\\.gradle\\.wrapper\\.GradleWrapperMain( |$)`,
   `${JAVA_MAIN}org\\.gradle\\.launcher\\.GradleMain( |$)`,
   `${JAVA_MAIN}org\\.codehaus\\.plexus\\.classworlds\\.launcher\\.Launcher( |$)`,
-  "^([^ ]*/)?cargo( \\+[^ ]+)? (build|test|bench|run)( |$)",
-  "^([^ ]*/)?go (build|test)( |$)",
-  "^([^ ]*/)?docker(-buildx)? (buildx )?build( |$)",
-  "^([^ ]*/)?bazel(-real)? (build|test)( |$)",
+  `${EXE}cargo( \\+[^ ]+)? (build|test|bench|run)( |$)`,
+  `${EXE}go (build|test)( |$)`,
+  `${EXE}docker(-buildx)? (buildx )?build( |$)`,
+  `${EXE}(docker compose|docker-compose( compose)?)( -[^ ]+( [^ -][^ ]*)?)* build( |$)`,
+  `${EXE}bazel(-real)? (build|test)( |$)`,
+  `${EXE}g?make( |$)`,
+  `${EXE}ninja( |$)`,
+  `${EXE}cmake( [^ ]+)* --build( |$)`,
+  `${EXE}xcodebuild( |$)`,
+  `${EXE}swift(-build|-test| build| test)( |$)`,
+  `${EXE}tsc( |$)`,
+  `${JS_SCRIPT}tsc( |$)`,
+  `${JS_SCRIPT}next build( |$)`,
+  `${JS_SCRIPT}vite build( |$)`,
+  `${EXE}(npm|pnpm|yarn|bun)( run| run-script)? ${SCRIPT}`,
+  `${JS_SCRIPT}(npm-cli\\.js|npm|pnpm(\\.c?js)?|yarn(-[^ /]*)?(\\.c?js)?)( run| run-script)? ${SCRIPT}`,
 ].join("|");
 
 export const FREEZE_PATTERN = [
@@ -668,10 +685,34 @@ export function jobOf(args) {
   if (other) {
     return `${other[1]} ${other[2]}`;
   }
+  const p = procProgram(text);
+  const job = p.tool ? jobIn([p.tool, ...p.args]) : null;
+  if (job !== null) {
+    return job;
+  }
   return tasksIn(text.split(/\s+/).map((w, i) => (i === 0 ? w.split("/").pop() : w)).join(" "));
 }
 
 const CONTINUOUS = new Set(["run", "bootRun", "quarkusDev", "quarkus:dev"]);
+
+// The program a process runs, looking past the interpreter of a Node or Bun script.
+export function procProgram(args) {
+  const words = String(args).trim().split(/\s+/).filter(Boolean);
+  const base = (w) => String(w ?? "").split("/").pop();
+  let i = 0;
+  if (["node", "nodejs"].includes(base(words[0])) || (base(words[0]) === "bun" && String(words[1] ?? "").includes("/"))) {
+    i = 1;
+    while (i < words.length && words[i].startsWith("-")) i += 1;
+  }
+  const raw = base(words[i]);
+  const rest = words.slice(i + 1);
+  const swift = raw.match(/^swift-(build|test)$/);
+  if (swift) {
+    return { tool: "swift", args: [swift[1], ...rest] };
+  }
+  const tool = raw.replace(/\.[cm]?js$/, "").replace(/^npm-cli$/, "npm").replace(/^yarn-.*$/, "yarn");
+  return { tool, args: rest };
+}
 
 export function isContinuous(args) {
   const text = String(args).trim();
@@ -976,6 +1017,38 @@ const WRAPPERS = new Set(["sudo", "env", "nice", "nohup", "timeout", "time", "ex
 const WRAPPER_VALUES = new Set(["-n", "-s", "-k", "-u", "-g", "-c", "-C", "-t", "-a", "--signal", "--kill-after", "--adjustment", "--unset", "--chdir", "--user"]);
 const JVM_TOOLS = new Set(["gradlew", "gradle", "mvnw", "mvn"]);
 const HEAVY_TASK = /^(?:build|test|check|integrationTest|assemble|install|verify|package|bootRun|run|compile\w*|jacoco\w*|codenarc\w*|e2e\w*)$/;
+const JS_PACKAGERS = ["npm", "pnpm", "yarn", "bun"];
+const JS_RUNNERS = new Set(["npx", "pnpx", "bunx"]);
+const JS_TOOLS = new Set(["tsc", "next", "vite"]);
+const MAKE_VALUES = new Set(["-C", "-f", "-I", "-o", "-W", "--directory", "--file", "--makefile", "--include-dir", "--old-file", "--assume-old", "--new-file", "--assume-new", "--what-if"]);
+const MAKE_LIGHT_FLAGS = new Set(["-n", "--dry-run", "--just-print", "--recon", "-q", "--question", "-p", "--print-data-base", "-v", "--version", "-h", "--help"]);
+const MAKE_LIGHT_TARGETS = new Set(["clean", "distclean", "mrproper", "clobber", "help"]);
+const NINJA_LIGHT = new Set(["--version", "-n", "-h", "--help"]);
+const TSC_LIGHT = new Set(["-v", "--version", "-h", "--help", "--all", "--init", "--showConfig", "--listFilesOnly"]);
+const XCODE_ACTIONS = new Set(["build", "build-for-testing", "analyze", "archive", "test", "test-without-building", "docbuild", "installsrc", "install", "clean"]);
+const XCODE_LIGHT = /^-(?:list|version|showsdks|showBuildSettings|showdestinations|showTestPlans|help|usage|license|checkFirstLaunchStatus|runFirstLaunch|showComponent|find-\w+)$/;
+const COMPOSE_COMMANDS = new Set(["attach", "build", "config", "cp", "create", "down", "events", "exec", "images", "kill", "logs", "ls", "pause", "port", "ps", "pull", "push", "restart", "rm", "run", "scale", "start", "stats", "stop", "top", "unpause", "up", "version", "wait", "watch"]);
+
+function makeJob(tool, args) {
+  const targets = [];
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i];
+    if (MAKE_LIGHT_FLAGS.has(w)) return null;
+    if (MAKE_VALUES.has(w)) i++;
+    else if ((w === "-j" || w === "-l") && /^\d+(?:\.\d+)?$/.test(args[i + 1] ?? "")) i++;
+    else if (!w.startsWith("-") && !w.includes("=")) targets.push(w);
+  }
+  if (targets.length > 0 && targets.every((t) => MAKE_LIGHT_TARGETS.has(t))) return null;
+  return `${tool} ${targets.slice(0, 3).join(" ")}`.trim();
+}
+
+function xcodeJob(args) {
+  if (args.some((w) => XCODE_LIGHT.test(w))) return null;
+  const actions = args.filter((w) => XCODE_ACTIONS.has(w));
+  if (actions.length > 0 && actions.every((a) => a === "clean")) return null;
+  const action = actions.find((a) => a !== "clean");
+  return action ? `xcodebuild ${action}` : "xcodebuild";
+}
 
 function segmentsOf(command) {
   const text = String(command);
@@ -1056,16 +1129,33 @@ function jobIn(words) {
   }
   const subs = args.filter((w) => !w.startsWith("-") && !w.startsWith("+"));
   const [first, second] = subs;
+  if (JS_RUNNERS.has(tool) || (JS_PACKAGERS.includes(tool) && ["exec", "dlx", "x"].includes(args[0]))) {
+    const rest = JS_RUNNERS.has(tool) ? args : args.slice(1);
+    let k = 0;
+    while (k < rest.length && rest[k].startsWith("-")) k += rest[k] === "-p" || rest[k] === "--package" ? 2 : 1;
+    return k < rest.length ? jobIn(rest.slice(k)) : null;
+  }
   if (tool === "cargo" && ["build", "test", "bench", "run"].includes(first)) return `cargo ${first}`;
   if (tool === "go" && ["build", "test"].includes(first)) return `go ${first}`;
-  if (["npm", "pnpm", "yarn", "bun"].includes(tool)) {
+  if (JS_PACKAGERS.includes(tool)) {
+    if (tool !== "npm" && JS_TOOLS.has(first)) return jobIn(args.slice(args.indexOf(first)));
     const script = first === "run" || first === "run-script" ? second : first;
     return /^(?:build|test|e2e)\b/.test(script ?? "") ? `${tool} ${script === first ? "" : `${first} `}${script}` : null;
   }
   if (tool === "docker" && first === "build") return "docker build";
   if (tool === "docker" && first === "buildx" && second === "build") return "docker buildx build";
-  if ((tool === "docker" && first === "compose") || tool === "docker-compose") return subs.includes("up") ? "docker compose up" : null;
+  if ((tool === "docker" && first === "compose") || tool === "docker-compose") {
+    const action = subs.slice(tool === "docker" ? 1 : 0).find((w) => COMPOSE_COMMANDS.has(w));
+    return action === "up" || action === "build" ? `docker compose ${action}` : null;
+  }
   if (["bazel", "bazelisk"].includes(tool) && ["build", "test"].includes(first)) return `bazel ${first}`;
+  if (tool === "make" || tool === "gmake") return makeJob(tool, args);
+  if (tool === "ninja") return args.some((w) => NINJA_LIGHT.has(w) || w.startsWith("-t")) ? null : "ninja";
+  if (tool === "cmake") return args.includes("--build") ? "cmake --build" : null;
+  if (tool === "xcodebuild") return xcodeJob(args);
+  if (tool === "swift" && ["build", "test"].includes(first)) return `swift ${first}`;
+  if (tool === "tsc") return args.some((w) => TSC_LIGHT.has(w)) ? null : "tsc";
+  if ((tool === "next" || tool === "vite") && first === "build") return `${tool} build`;
   return null;
 }
 
