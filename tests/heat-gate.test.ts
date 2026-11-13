@@ -1,5 +1,9 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { BUILD_PATTERN, FREEZE_PATTERN, bandPlan, procProgram, bytesOf, canThaw, cellsOf, configure, cpuPercent, heatLabel, isContinuous, isHeavy, labelOf, levelOf, meter, jobOf, parseDocker, parseSense, pressureOf, projectOf, secondsOf, shouldFreeze, tooHot, turboCommand } from '../hooks/heat-gate.mjs'
+import { BUILD_PATTERN, FREEZE_PATTERN, bandPlan, freezeTargets, procProgram, bytesOf, canThaw, cellsOf, configure, cpuPercent, heatLabel, isContinuous, isHeavy, labelOf, levelOf, meter, jobOf, parseDocker, parseSense, pressureOf, projectOf, secondsOf, shouldFreeze, tooHot, turboCommand } from '../hooks/heat-gate.mjs'
+
+type Proc = [number, number, string, string]
+const table = (rows: Proc[]) => rows.map(([pid, ppid, comm, args]) => `T\t${pid}\t${ppid}\t${comm}\nA\t${pid}\t${args}\n`).join('')
+const daemon = (pid: number): Proc => [pid, 1, 'java', '/opt/jdk/bin/java -cp /x/gradle-launcher.jar org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.12']
 
 const sense = (tctl: number, builds = '') =>
   `S ${tctl * 1000} ${tctl * 1000} 105000 1 7.40 16 /sys/devices/system/cpu/cpufreq/boost\n${builds}P\t227\tjava\nP\t96\tnode\n`
@@ -230,6 +234,47 @@ test('a JavaScript dev server, go run or a watch is not a running build', () => 
   expect(out.builds.map((b: any) => [b.pid, b.job])).toEqual([[3, 'next build']])
 })
 
+// A user shell running Claude Code, Claude's own command shell, and below it builds of
+// several kinds, a dev server, a browser a test opened and the Docker client.
+const TREE: Proc[] = [
+  [100, 1, '-zsh', '-zsh'],
+  [200, 100, 'claude', 'claude'],
+  [300, 200, '/bin/zsh', "/bin/zsh -c eval 'npm run build'"],
+  [301, 300, 'npm', 'npm run build'],
+  [302, 301, 'sh', 'sh -c next build'],
+  [303, 302, 'node', 'node /p/web/node_modules/.bin/next build'],
+  [304, 303, 'node', '/usr/local/bin/node /p/web/node_modules/next/dist/compiled/jest-worker/processChild.js'],
+  [305, 303, '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless'],
+  [306, 305, 'Google Chrome Helper', 'Google Chrome Helper --type=renderer'],
+  [400, 200, 'npm', 'npm run dev'],
+  [401, 400, 'node', 'node /p/web/node_modules/.bin/vite'],
+  [500, 1, 'code', '/usr/share/code/code'],
+  [501, 1, 'firefox', '/usr/lib/firefox/firefox'],
+  [600, 200, 'make', 'make -j4'],
+  [601, 600, '/bin/sh', '/bin/sh -c cc -O2 -c a.c'],
+  [602, 601, 'cc', 'cc -O2 -c a.c'],
+  [603, 600, 'cc1', '/usr/lib/gcc/cc1 b.c'],
+  [700, 200, 'go', '/usr/local/go/bin/go test ./...'],
+  [701, 700, 'pkg.test', '/tmp/go-build123/b001/pkg.test -test.v'],
+  [800, 200, 'docker', 'docker build -t app .'],
+  [900, 1, 'codegen', 'my-codegen --all'],
+  [901, 900, 'protoc', 'protoc --go_out=. api.proto'],
+  [902, 1, 'vim', 'vim my-codegen.yml'],
+  [903, 100, 'bash', 'bash -c my-codegen --all'],
+]
+
+test('the freeze takes the whole tree of every build, whatever the program, and nothing else', () => {
+  configure({})
+  expect(freezeTargets(table(TREE))).toEqual(['301', '303', '304', '600', '602', '603', '700', '701'])
+  configure({ extra_freeze_pattern: 'my-codegen' })
+  expect(freezeTargets(table(TREE))).toEqual(['301', '303', '304', '600', '602', '603', '700', '701', '900', '901'])
+  configure({ extra_freeze_pattern: '(' })
+  expect(freezeTargets(table(TREE))).toEqual(['301', '303', '304', '600', '602', '603', '700', '701'])
+  configure({})
+  expect(freezeTargets(table([daemon(4242), [4250, 4242, 'java', 'java -cp x worker.org.gradle.process.internal.worker.GradleWorkerMain 3']]))).toEqual(['4242', '4250'])
+  expect(freezeTargets('A\t77\tnpm run build\n')).toEqual([])
+})
+
 test('labels a build with its tool and tasks', () => {
   expect(labelOf('cd a && ./gradlew clean check integrationTest --continue')).toBe('gradlew clean check integrationTest')
   expect(labelOf('cargo test --all')).toBe('cargo test')
@@ -318,7 +363,7 @@ type State = {
   pressure?: number
   calls?: string[][]
   writes?: [string, unknown][]
-  pgrep?: string
+  procs?: string
   lockBusy?: boolean
   abort?: boolean
   onCont?: () => void
@@ -333,8 +378,8 @@ function stubs(on: any, state: State) {
     if (e.argv[0] === 'sh' && script.includes('admit.lock')) {
       return { value: { exitCode: state.lockBusy ? 1 : 0, stdout: state.lockBusy ? '' : '/data/heat-gate/admit.lock\n', stderr: '' } }
     }
-    if (e.argv[0] === 'sh' && script.includes('pgrep')) {
-      return { value: { exitCode: 0, stdout: state.pgrep ?? '', stderr: '' } }
+    if (e.argv[0] === 'sh' && script.includes('ps -U')) {
+      return { value: { exitCode: 0, stdout: state.procs ?? '', stderr: '' } }
     }
     if (e.argv[0] === 'kill' && e.argv[1] === '-CONT') state.onCont?.()
     if (e.argv[0] === 'bash') {
@@ -601,14 +646,14 @@ test('ending the session drops its tickets, and after /clear the band keeps refr
 })
 
 test('at 98°C the builds freeze with a 10 minute guard, and they resume below 82°C', async ($, on) => {
-  const state: State = { tctl: 98, builds: '', saved: new Map(), ran: [], calls: [], pgrep: '4242\n4243\n' }
+  const state: State = { tctl: 98, builds: '', saved: new Map(), ran: [], calls: [], procs: table([daemon(4242), daemon(4243)]) }
   const clock = stubs(on, state)
   startStubs(on)
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
   const calls = state.calls!
-  const pgrep = calls.find((argv) => argv[0] === 'sh' && argv[2].includes('pgrep'))!
-  expect(pgrep[2]).toContain('pgrep -u "$(id -u)" -f')
-  expect(pgrep[4]).toBe(FREEZE_PATTERN)
+  const scan = calls.find((argv) => argv[0] === 'sh' && argv[2].includes('ps -U'))!
+  expect(scan[2]).toContain('u=$(id -u)')
+  expect(scan[2]).toContain('ps -U "$u"')
   expect(calls).toContainEqual(['kill', '-STOP', '4242', '4243'])
   const guard = calls.find((argv) => argv[0] === 'sh' && argv[2].includes('setsid'))!
   expect(guard[2]).toContain('nohup')
@@ -625,7 +670,7 @@ test('at 98°C the builds freeze with a 10 minute guard, and they resume below 8
 })
 
 test('a freeze lasts 10 minutes at most and a CPU still hot freezes again', async ($, on) => {
-  const state: State = { tctl: 99, builds: '', saved: new Map(), ran: [], calls: [], pgrep: '4242\n' }
+  const state: State = { tctl: 99, builds: '', saved: new Map(), ran: [], calls: [], procs: table([daemon(4242)]) }
   const clock = stubs(on, state)
   startStubs(on)
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
@@ -640,7 +685,7 @@ test('a freeze lasts 10 minutes at most and a CPU still hot freezes again', asyn
 })
 
 test('a second freeze keeps the pids of the first, and resuming never drops a newer freeze', async ($, on) => {
-  const state: State = { tctl: 60, builds: '', saved: new Map(), ran: [], calls: [], pgrep: '4242\n' }
+  const state: State = { tctl: 60, builds: '', saved: new Map(), ran: [], calls: [], procs: table([daemon(4242)]) }
   const clock = stubs(on, state)
   startStubs(on)
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
@@ -657,6 +702,32 @@ test('a second freeze keeps the pids of the first, and resuming never drops a ne
   await pane.press({ key: 'thaw' })
   expect(state.calls).toContainEqual(['kill', '-CONT', '7', '4242'])
   expect(state.saved.get('frozen')).toEqual(newer)
+})
+
+test('at 98°C a JavaScript, make and Go build tree freezes with the guard and resumes below 82°C', async ($, on) => {
+  configure({})
+  const state: State = { tctl: 99, builds: '', saved: new Map(), ran: [], calls: [], procs: table(TREE) }
+  const clock = stubs(on, state)
+  startStubs(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+  const pids = ['301', '303', '304', '600', '602', '603', '700', '701']
+  expect(state.calls).toContainEqual(['kill', '-STOP', ...pids])
+  const guard = state.calls!.find((argv) => argv[0] === 'sh' && argv[2].includes('setsid'))!
+  expect(guard.slice(3)).toEqual(['heat-gate-guard-1000000', '600', ...pids])
+  expect(state.saved.get('frozen')).toMatchObject({ pids, reason: 'auto' })
+  state.tctl = 80
+  await clock.advance(4000)
+  expect(state.calls).toContainEqual(['kill', '-CONT', ...pids])
+  expect(state.saved.has('frozen')).toBe(false)
+})
+
+test('extra_freeze_pattern adds processes to the freeze', { options: { extra_freeze_pattern: 'my-codegen' } }, async ($, on) => {
+  const state: State = { tctl: 99, builds: '', saved: new Map(), ran: [], calls: [], procs: table(TREE.filter(([pid]) => pid >= 900)) }
+  stubs(on, state)
+  startStubs(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+  expect(state.calls).toContainEqual(['kill', '-STOP', '900', '901'])
+  configure({})
 })
 
 test('a running dev server does not hold an npm build', async ($, on) => {

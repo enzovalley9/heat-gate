@@ -14,7 +14,7 @@ const COLOR = { cool: "#87d7ff", ok: "#afd7af", warm: "#ffd787", hot: "#ffaf5f",
 
 const PRESSURE_COLORS = [COLOR.ok, COLOR.warm, COLOR.hot, COLOR.fire, COLOR.fire];
 
-const DEFAULTS = { language: "en", hold_above: 80, release_below: 75, freeze_enabled: true, freeze_at: 98, thaw_below: 82, max_wait_minutes: 30, extra_build_pattern: "" };
+const DEFAULTS = { language: "en", hold_above: 80, release_below: 75, freeze_enabled: true, freeze_at: 98, thaw_below: 82, max_wait_minutes: 30, extra_build_pattern: "", extra_freeze_pattern: "" };
 
 const STRINGS = {
   en: {
@@ -189,7 +189,26 @@ export const FREEZE_PATTERN = [
   "^([^ ]*/)?cargo( \\+[^ ]+)? (build|test|bench)( |$)",
 ].join("|");
 
-const PGREP_MINE = 'exec pgrep -u "$(id -u)" -f "$1"';
+// Lists the processes of the current user twice: with their parent and name, and with
+// their full command line. The freeze builds the process tree from both.
+const SCAN = `
+u=$(id -u)
+ps -U "$u" -o pid= -o ppid= -o comm= | awk '{p = $1; q = $2; $1 = ""; $2 = ""; sub(/^ +/, ""); printf "T\\t%s\\t%s\\t%s\\n", p, q, $0}'
+ps -U "$u" -ww -o pid= -o args= | awk '{p = $1; $1 = ""; sub(/^ +/, ""); printf "A\\t%s\\t%s\\n", p, $0}'
+`;
+
+// Processes the freeze never pauses, even inside a build: shells, terminals, editors,
+// browsers, Claude Code and the container machinery. A build's shell is walked through
+// so the compilers it runs are paused, but the shell itself is left alone.
+const SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "pwsh"]);
+const NEVER = new Set([
+  ...SHELLS,
+  ...["login", "sshd", "ssh", "tmux", "screen", "mosh-server", "claude"],
+  ...["vim", "nvim", "vi", "view", "emacs", "nano", "micro", "hx", "helix", "code", "code-insiders", "cursor", "windsurf", "zed", "subl", "sublime_text", "idea", "pycharm", "webstorm", "goland", "clion", "rider", "studio"],
+  ...["firefox", "firefox-bin", "safari", "brave", "msedge", "opera", "vivaldi"],
+  ...["docker", "dockerd", "containerd", "runc", "crun", "conmon", "podman", "colima", "limactl"],
+]);
+const NEVER_PREFIX = ["chrom", "google chrome", "microsoft edge", "brave browser", "code helper", "cursor helper", "containerd-shim", "com.docker."];
 
 const GUARD = `
 if command -v setsid >/dev/null 2>&1; then
@@ -286,6 +305,7 @@ ps -eo pcpu=,comm= --sort=-pcpu | head -5 | awk '{printf "P\\t%s\\t%s\\n",$1,$2}
 let cfg = { ...DEFAULTS };
 let L = STRINGS.en;
 let extraHeavy = null;
+let extraFreeze = null;
 let samples = [];
 let builds = [];
 let hogs = [];
@@ -308,6 +328,11 @@ export function configure(options) {
     extraHeavy = cfg.extra_build_pattern ? new RegExp(cfg.extra_build_pattern) : null;
   } catch {
     extraHeavy = null;
+  }
+  try {
+    extraFreeze = cfg.extra_freeze_pattern ? new RegExp(cfg.extra_freeze_pattern) : null;
+  } catch {
+    extraFreeze = null;
   }
   return cfg;
 }
@@ -924,14 +949,66 @@ async function guardFreeze($) {
   }
 }
 
+function untouchable(name) {
+  const path = String(name ?? "");
+  // A macOS app bundle keeps its own executables in Contents/MacOS: editors, browsers,
+  // terminals and Docker Desktop. Xcode's compilers live in Contents/Developer instead.
+  if (/\.app\/Contents\/MacOS\//.test(path)) return true;
+  const base = path.split("/").pop().replace(/^-/, "").toLowerCase();
+  return NEVER.has(base) || NEVER_PREFIX.some((p) => base.startsWith(p));
+}
+
+// Picks the processes an emergency freeze pauses from a SCAN of the user's processes:
+// the processes FREEZE_PATTERN or extra_freeze_pattern name, every running build that is
+// not a dev server, and everything that hangs below them, whatever program it is.
+export function freezeTargets(stdout) {
+  const procs = new Map();
+  for (const line of String(stdout).split("\n")) {
+    const parts = line.split("\t");
+    const pid = parts[1] ?? "";
+    if (!/^\d+$/.test(pid) || (parts[0] !== "T" && parts[0] !== "A")) continue;
+    const p = procs.get(pid) ?? { pid, ppid: null, name: "", args: "" };
+    if (parts[0] === "T") {
+      p.ppid = parts[2] ?? "";
+      p.name = parts.slice(3).join("\t");
+    } else {
+      p.args = parts.slice(2).join("\t");
+    }
+    procs.set(pid, p);
+  }
+  const freezeRe = new RegExp(FREEZE_PATTERN);
+  const buildRe = new RegExp(BUILD_PATTERN);
+  const children = new Map();
+  for (const p of procs.values()) {
+    if (p.ppid === null) continue;
+    if (!children.has(p.ppid)) children.set(p.ppid, []);
+    children.get(p.ppid).push(p.pid);
+  }
+  const seeds = [...procs.values()].filter((p) => p.ppid !== null && !untouchable(p.name) && (freezeRe.test(p.args) || (extraFreeze !== null && extraFreeze.test(p.args)) || (buildRe.test(p.args) && !isContinuous(p.args))));
+  const picked = new Set();
+  const seen = new Set();
+  const todo = seeds.map((p) => p.pid);
+  while (todo.length > 0) {
+    const pid = todo.shift();
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    const p = procs.get(pid);
+    if (!p || p.ppid === null) continue;
+    if (!untouchable(p.name)) picked.add(pid);
+    else if (!SHELLS.has(p.name.split("/").pop().replace(/^-/, "").toLowerCase())) continue;
+    todo.push(...(children.get(pid) ?? []));
+  }
+  return [...picked].sort((a, b) => Number(a) - Number(b));
+}
+
 async function freeze($, reason) {
   let run;
   try {
-    run = await $.process.run(["sh", "-c", PGREP_MINE, "heat-gate", FREEZE_PATTERN], { timeoutMs: 5000 });
+    run = await $.process.run(["sh", "-c", SCAN, "heat-gate-scan"], { timeoutMs: 5000 });
   } catch {
     return;
   }
-  const pids = run.stdout.split("\n").map((x) => x.trim()).filter((x) => /^\d+$/.test(x));
+  const pids = freezeTargets(run.stdout);
   if (pids.length === 0) {
     return;
   }

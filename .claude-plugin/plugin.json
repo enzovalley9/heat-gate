@@ -7,7 +7,7 @@
   "homepage": "https://github.com/enzovalley9/heat-gate",
   "repository": "https://github.com/enzovalley9/heat-gate",
   "license": "MIT",
-  "keywords": ["mod", "thermal", "cpu", "builds", "gradle", "linux", "macos"],
+  "keywords": ["mod", "thermal", "cpu", "builds", "npm", "cargo", "gradle", "make", "linux", "macos"],
   "userConfig": {
     "language": { "type": "string", "title": "Language", "description": "Language of the band, the pane and the messages", "options": ["en", "es"], "default": "en" },
     "hold_above": { "type": "number", "title": "Hold builds from (°C)", "description": "Linux: a heavy build waits in the queue when the CPU is at or above this temperature. macOS follows the thermal pressure instead", "default": 80, "min": 50, "max": 110 },
@@ -16,6 +16,7 @@
     "freeze_at": { "type": "number", "title": "Freeze at (°C)", "description": "Linux: temperature that triggers the emergency freeze. macOS freezes when the thermal pressure is high", "default": 98, "min": 60, "max": 120 },
     "thaw_below": { "type": "number", "title": "Resume below (°C)", "description": "Linux: frozen builds resume once the CPU is below this temperature", "default": 82, "min": 40, "max": 110 },
     "max_wait_minutes": { "type": "number", "title": "Maximum wait (minutes)", "description": "A queued build is refused after waiting this long", "default": 30, "min": 1, "max": 240 },
-    "extra_build_pattern": { "type": "string", "title": "Extra build pattern", "description": "Optional regular expression for more commands to treat as heavy builds, such as make -j|ninja", "default": "" }
+    "extra_build_pattern": { "type": "string", "title": "Extra build pattern", "description": "Optional regular expression for more commands to treat as heavy builds, such as just build|scons", "default": "" },
+    "extra_freeze_pattern": { "type": "string", "title": "Extra freeze pattern", "description": "Optional regular expression for more processes, matched against their full command line, that the emergency freeze pauses together with everything they started", "default": "" }
   }
 }
