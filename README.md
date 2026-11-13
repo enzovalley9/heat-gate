@@ -2,7 +2,9 @@
 
 A [Claude Code](https://code.claude.com) mod that keeps parallel sessions from cooking your laptop.
 
-When several Claude Code sessions run Gradle, Maven, Cargo or Docker builds at the same time, a laptop can hit its critical temperature and shut down without warning. heat-gate watches the CPU temperature and turns heavy builds into a queue shared by every session.
+Picture three Claude Code sessions in three projects: one runs `npm run build`, another `cargo test` and the third `./gradlew check`, all at the same time. A laptop can hit its critical temperature and shut down without warning. heat-gate watches the CPU temperature and turns heavy builds into a queue shared by every session, so the second and third build wait until the first one is done and the CPU has cooled down.
+
+It works with the usual build tools: npm, pnpm, Yarn and Bun scripts, TypeScript, Next.js and Vite, Cargo, Go, make, Ninja, CMake, Xcode, Swift, Gradle, Maven, Bazel and Docker.
 
 ![heat-gate holds a Gradle build while the CPU is hot and starts it by itself once it cools down](docs/heat-gate.gif)
 
@@ -16,13 +18,21 @@ When several Claude Code sessions run Gradle, Maven, Cargo or Docker builds at t
   ![The same band at 130, 100, 76, 58 and 40 columns](docs/heat-gate-responsive.png)
 
 - **Shared build queue.** A heavy command waits when the CPU is at or above 80°C, when another build is already running or when one has just started. Queued builds start on their own once the CPU drops below 75°C. While a build waits you can press `1` to run it now or `2` to cancel it. After 30 minutes in the queue it is refused.
-- **Servers do not block the queue.** `bootRun`, `run`, `spring-boot:run`, `quarkusDev`, a continuous Gradle build (`-t`) or `cargo run` wait their turn to start, since they compile first, but once they are up they no longer count as a running build.
-- **Emergency freeze.** At 98°C the build processes are paused with `SIGSTOP` and resumed with `SIGCONT` below 82°C, so a runaway build cannot take the machine down. Every freeze also arms a safety timer outside Claude Code that resumes those processes after 10 minutes at most, even if every session is closed or the mod is removed; if the CPU is still that hot, the next check freezes them again.
+- **Servers do not block the queue.** A dev server such as `npm run dev`, `pnpm start`, `yarn serve`, `bun run dev`, `next dev` or `vite`, a `tsc --watch`, `go run` or `cargo run`, and on the JVM `bootRun`, `run`, `spring-boot:run`, `quarkusDev` or a continuous Gradle build (`-t`) never counts as a running build once it is up. `go run`, `cargo run` and the Gradle and Maven ones wait their turn to start, since they compile first.
+- **Emergency freeze.** At 98°C the builds are paused with `SIGSTOP` and resumed with `SIGCONT` below 82°C, so a runaway build cannot take the machine down. The freeze takes every process a running build started, whatever the program: the webpack workers below `npm run build`, the compilers below `make`, the test binaries below `go test`. Every freeze also arms a safety timer outside Claude Code that resumes all those processes after 10 minutes at most, even if every session is closed or the mod is removed. If the CPU is still that hot, the next check freezes them again.
 - **Linux and macOS.** On a Mac, with Apple Silicon or Intel, the gate follows the thermal pressure that macOS reports (see [macOS](#macos)).
 - **`/heat` pane** with CPU, memory (and swap) and Docker tiles, a temperature chart and a CPU and memory chart (SVG in the desktop app, text in the terminal), each container with its CPU and memory, the builds, the queue, the processes using the most CPU, a manual freeze button and the command to turn turbo boost off.
 - **Light on the machine.** One session reads the sensors every 4 seconds and the containers every 2 minutes, and every other session reuses that reading, so opening more sessions adds no load.
 
-Heavy commands are Gradle and Maven tasks such as `build`, `test` or `bootRun`, `cargo build|test|bench|run`, `go build|test`, `npm|pnpm|yarn|bun` builds and tests, `docker build`, `docker compose up` and `bazel build|test`. Each part of a command line (split on `;`, `&&`, `||`, `|` and new lines) is judged by the program it runs, after variables such as `FOO=1` and wrappers such as `timeout`, `env` or `nice`, so `/repo/gradlew build` or `"./gradlew" test` count and `git commit -m "fix go test"` does not. You can add your own.
+Heavy commands are:
+
+- `npm|pnpm|yarn|bun` build and test scripts, `tsc`, `next build` and `vite build`, also through `npx`, `pnpm exec` or `yarn`
+- `cargo build|test|bench|run` and `go build|test|run`
+- `make` and `gmake` (but not `make clean`, `make help` or a dry run), `ninja`, `cmake --build`, `xcodebuild` builds, tests and archives, and `swift build|test`
+- Gradle and Maven tasks such as `build`, `test` or `bootRun`, and `bazel build|test`
+- `docker build`, `docker compose build` and `docker compose up`
+
+Each part of a command line (split on `;`, `&&`, `||`, `|` and new lines) is judged by the program it runs, after variables such as `FOO=1` and wrappers such as `timeout`, `env` or `nice`. So `cd web && npm run build` or `/repo/gradlew build` count, while `cmake -S . -B build`, `automake` or `git commit -m "make go test pass"` do not. You can add your own with `extra_build_pattern`.
 
 If the mod itself fails, the command runs as usual: heat-gate never blocks your work because of a bug of its own.
 
@@ -39,7 +49,7 @@ A heavy command starts at once when the CPU is below `hold_above`, no build is r
 
 A queued build renews its place in the queue every time it checks. A build interrupted with Esc gives its turn back, and when a session ends its queued builds leave the queue at once. A turn that nobody renews for 15 seconds, such as one from a session that died without closing, drops out on its own, so it never holds the others. A `/clear` or a `/resume` keeps the band running.
 
-The emergency freeze only touches your own build processes: Java processes whose main class is a Gradle daemon or worker (test executors included) or Maven, and `rustc`/`cargo`. Your editor, browser, containers and shells are never paused.
+The emergency freeze only touches your own processes. It starts from the builds that are running (any of the heavy commands above that is not a dev server), Gradle daemons and workers, Maven, `rustc` and `cargo`, plus anything `extra_freeze_pattern` names, and then follows the process tree down from each of them, so it pauses whatever program the build started. Shells, terminals, editors, browsers, Claude Code itself and the Docker and container processes are never paused, not even inside a build. A shell inside a build is skipped while the processes it runs are paused. A `docker build` runs inside the Docker daemon, so it keeps running.
 
 ## In the terminal
 
@@ -97,7 +107,8 @@ Set them in `/plugin`, or pass `--config KEY=VALUE` to `claude plugin install`.
 | `freeze_at` | `98` | Linux: temperature that triggers the freeze |
 | `thaw_below` | `82` | Linux: frozen builds resume below this temperature |
 | `max_wait_minutes` | `30` | A queued build is refused after waiting this long |
-| `extra_build_pattern` | empty | Regular expression for more heavy commands, for example `make -j\|ninja` |
+| `extra_build_pattern` | empty | Regular expression for more heavy commands, for example `just build\|scons` |
+| `extra_freeze_pattern` | empty | Regular expression for more processes the emergency freeze pauses, matched against their full command line, together with everything they started. For example `my-codegen\|protoc` |
 
 ## Uninstall
 
@@ -105,7 +116,7 @@ Set them in `/plugin`, or pass `--config KEY=VALUE` to `claude plugin install`.
 claude plugin uninstall heat-gate@heat-gate
 ```
 
-If a freeze was active when the mod was removed, the builds resume on their own within 10 minutes. To resume them at once, run `pkill -CONT -f GradleDaemon` (or the process you need).
+If a freeze was active when the mod was removed, the builds resume on their own within 10 minutes. To resume them at once, send `SIGCONT` to the paused processes, for example `pkill -CONT -x make` or `pkill -CONT -f GradleDaemon`.
 
 ## Tests
 
